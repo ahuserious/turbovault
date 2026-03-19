@@ -14,14 +14,18 @@ pub struct LinkGraph {
     /// Directed graph: nodes are file paths, edges are links
     graph: DiGraph<PathBuf, Link>,
 
-    /// Map from file name (stem) to node index
+    /// Map from file name (stem, lowercased) to node index
     file_index: HashMap<String, NodeIndex>,
 
-    /// Map from aliases to node index
+    /// Map from aliases (lowercased) to node index
     alias_index: HashMap<String, NodeIndex>,
 
     /// Map from full path to node index (for quick lookups)
     path_index: HashMap<PathBuf, NodeIndex>,
+
+    /// Links that could not be resolved to a target file, grouped by source path.
+    /// Used by HealthAnalyzer for broken link detection.
+    unresolved_links: HashMap<PathBuf, Vec<Link>>,
 }
 
 impl LinkGraph {
@@ -32,6 +36,7 @@ impl LinkGraph {
             file_index: HashMap::new(),
             alias_index: HashMap::new(),
             path_index: HashMap::new(),
+            unresolved_links: HashMap::new(),
         }
     }
 
@@ -46,18 +51,18 @@ impl LinkGraph {
             let idx = self.graph.add_node(path.clone());
             self.path_index.insert(path.clone(), idx);
 
-            // Add to file_index by stem
+            // Add to file_index by stem (lowercased for case-insensitive resolution)
             if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                self.file_index.insert(stem.to_string(), idx);
+                self.file_index.insert(stem.to_lowercase(), idx);
             }
 
             idx
         };
 
-        // Register aliases from frontmatter
+        // Register aliases from frontmatter (lowercased for case-insensitive resolution)
         if let Some(fm) = &file.frontmatter {
             for alias in fm.aliases() {
-                self.alias_index.insert(alias, node_idx);
+                self.alias_index.insert(alias.to_lowercase(), node_idx);
             }
         }
 
@@ -69,9 +74,10 @@ impl LinkGraph {
         if let Some(&idx) = self.path_index.get(path) {
             // Remove from all indices
             self.path_index.remove(path);
+            self.unresolved_links.remove(path);
 
             if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                self.file_index.remove(stem);
+                self.file_index.remove(&stem.to_lowercase());
             }
 
             // Remove aliases pointing to this node
@@ -97,49 +103,67 @@ impl LinkGraph {
             idx
         };
 
-        // Remove old outgoing edges
+        // Remove old outgoing edges and unresolved links for this source
         let outgoing: Vec<_> = self.graph.edges(source_idx).map(|e| e.id()).collect();
         for edge_id in outgoing {
             self.graph.remove_edge(edge_id);
         }
+        self.unresolved_links.remove(source_path);
 
         // Add edges for each internal link (wikilinks and embeds)
         for link in &file.links {
-            if matches!(link.type_, LinkType::WikiLink | LinkType::Embed)
-                && let Some(target_idx) = self.resolve_link(&link.target)
-            {
-                // Add edge (both nodes already exist from add_file)
-                self.graph.add_edge(source_idx, target_idx, link.clone());
+            if matches!(link.type_, LinkType::WikiLink | LinkType::Embed) {
+                if let Some(target_idx) = self.resolve_link(&link.target) {
+                    self.graph.add_edge(source_idx, target_idx, link.clone());
+                } else {
+                    // Track unresolved links for broken link detection
+                    let mut broken = link.clone();
+                    broken.is_valid = false;
+                    self.unresolved_links
+                        .entry(source_path.clone())
+                        .or_default()
+                        .push(broken);
+                }
             }
         }
 
         Ok(())
     }
 
-    /// Resolve a wikilink target to a file path and node index
+    /// Resolve a wikilink target to a file path and node index.
+    /// Resolution is case-insensitive to match Obsidian's behaviour.
     fn resolve_link(&self, target: &str) -> Option<NodeIndex> {
         // Remove block/heading references
         let clean_target = target.split('#').next()?.trim();
+        let clean_lower = clean_target.to_lowercase();
 
-        // Try direct stem match
-        if let Some(&idx) = self.file_index.get(clean_target) {
+        // Try direct stem match (case-insensitive)
+        if let Some(&idx) = self.file_index.get(&clean_lower) {
             return Some(idx);
         }
 
-        // Try alias match
-        if let Some(&idx) = self.alias_index.get(clean_target) {
+        // Try alias match (case-insensitive)
+        if let Some(&idx) = self.alias_index.get(&clean_lower) {
             return Some(idx);
         }
 
-        // Try path-like match (folder/Note)
-        let target_parts: Vec<&str> = clean_target.split('/').filter(|p| !p.is_empty()).collect();
+        // Try path-like match (folder/Note) with case-insensitive comparison
+        let target_parts: Vec<String> = clean_target
+            .split('/')
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_lowercase())
+            .collect();
         if target_parts.is_empty() {
             return None;
         }
 
         // Find file path that matches the tail of the target path
         for (path, &idx) in self.path_index.iter() {
-            let path_parts: Vec<&str> = path.iter().filter_map(|p| p.to_str()).collect();
+            let path_parts: Vec<String> = path
+                .iter()
+                .filter_map(|p| p.to_str())
+                .map(|p| p.to_lowercase())
+                .collect();
 
             if path_parts.len() >= target_parts.len() {
                 let start = path_parts.len() - target_parts.len();
@@ -347,6 +371,13 @@ impl LinkGraph {
         result
     }
 
+    /// Get all unresolved links, grouped by source file.
+    /// Each link has `is_valid == false` and represents a wikilink or embed
+    /// whose target could not be resolved to an existing vault file.
+    pub fn all_unresolved_links(&self) -> &HashMap<PathBuf, Vec<Link>> {
+        &self.unresolved_links
+    }
+
     /// Find connected components in the graph (using undirected view)
     pub fn connected_components(&self) -> Result<Vec<Vec<PathBuf>>> {
         use petgraph::algo::tarjan_scc;
@@ -483,5 +514,65 @@ mod tests {
         assert_eq!(stats.total_files, 2);
         assert_eq!(stats.total_links, 1);
         assert_eq!(stats.orphaned_files, 0); // Both notes have links: note1 has incoming, note2 has outgoing
+    }
+
+    #[test]
+    fn test_unresolved_links_tracked() {
+        let mut graph = LinkGraph::new();
+        let file1 = create_test_file("note1.md", vec![]);
+        // note2 links to note1 (exists) and nonexistent (doesn't exist)
+        let file2 = create_test_file("note2.md", vec!["note1", "nonexistent"]);
+
+        graph.add_file(&file1).unwrap();
+        graph.add_file(&file2).unwrap();
+        graph.update_links(&file2).unwrap();
+
+        // Resolved link should be in the graph
+        assert_eq!(graph.edge_count(), 1);
+
+        // Unresolved link should be tracked
+        let unresolved = graph.all_unresolved_links();
+        let note2_path = PathBuf::from("note2.md");
+        assert!(unresolved.contains_key(&note2_path));
+        assert_eq!(unresolved[&note2_path].len(), 1);
+        assert_eq!(unresolved[&note2_path][0].target, "nonexistent");
+        assert!(!unresolved[&note2_path][0].is_valid);
+    }
+
+    #[test]
+    fn test_case_insensitive_resolution() {
+        let mut graph = LinkGraph::new();
+        let file1 = create_test_file("My Note.md", vec![]);
+        // Link uses different case
+        let file2 = create_test_file("linker.md", vec!["my note"]);
+
+        graph.add_file(&file1).unwrap();
+        graph.add_file(&file2).unwrap();
+        graph.update_links(&file2).unwrap();
+
+        // Should resolve despite case mismatch
+        assert_eq!(graph.edge_count(), 1);
+        assert!(graph.all_unresolved_links().is_empty());
+    }
+
+    #[test]
+    fn test_unresolved_links_cleared_on_update() {
+        let mut graph = LinkGraph::new();
+        let file1 = create_test_file("note1.md", vec![]);
+        let file2_broken = create_test_file("note2.md", vec!["nonexistent"]);
+
+        graph.add_file(&file1).unwrap();
+        graph.add_file(&file2_broken).unwrap();
+        graph.update_links(&file2_broken).unwrap();
+
+        assert_eq!(graph.all_unresolved_links().len(), 1);
+
+        // Now update note2 to link to note1 instead
+        let file2_fixed = create_test_file("note2.md", vec!["note1"]);
+        graph.update_links(&file2_fixed).unwrap();
+
+        // Unresolved links should be cleared
+        assert!(graph.all_unresolved_links().is_empty());
+        assert_eq!(graph.edge_count(), 1);
     }
 }

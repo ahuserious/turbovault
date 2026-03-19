@@ -62,10 +62,16 @@ impl VaultManager {
         let md_files = self.scan_files()?;
         log::info!("Found {} markdown files", md_files.len());
 
+        // Two-pass initialization: first add all files to the graph index,
+        // then resolve links. This ensures every file is discoverable when
+        // resolving wikilink targets, regardless of scan order.
+        let mut parsed_files = Vec::with_capacity(md_files.len());
+        let now = self.current_timestamp();
+
+        // Pass 1: parse all files, populate cache and graph nodes
         for file_path in md_files {
             log::debug!("Processing file: {:?}", file_path);
             if let Ok(content) = tokio::fs::read_to_string(&file_path).await {
-                // Parse file
                 match self.parser.parse_file(&file_path, &content) {
                     Ok(vault_file) => {
                         log::debug!(
@@ -74,8 +80,6 @@ impl VaultManager {
                             vault_file.links.len()
                         );
 
-                        // Cache file
-                        let now = self.current_timestamp();
                         cache.insert(
                             file_path.clone(),
                             CacheEntry {
@@ -84,9 +88,8 @@ impl VaultManager {
                             },
                         );
 
-                        // Add to graph
                         let _ = graph.add_file(&vault_file);
-                        let _ = graph.update_links(&vault_file);
+                        parsed_files.push(vault_file);
                     }
                     Err(e) => {
                         log::warn!("Failed to parse {}: {}", file_path.display(), e);
@@ -95,6 +98,11 @@ impl VaultManager {
             } else {
                 log::warn!("Failed to read file: {:?}", file_path);
             }
+        }
+
+        // Pass 2: resolve links (all files now in the index)
+        for vault_file in &parsed_files {
+            let _ = graph.update_links(vault_file);
         }
 
         log::info!(
