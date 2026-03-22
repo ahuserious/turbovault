@@ -72,11 +72,14 @@ impl FileTools {
         path: &str,
         content: &str,
         mode: WriteMode,
+        expected_hash: Option<&str>,
     ) -> Result<()> {
         match mode {
             WriteMode::Overwrite => {
                 let file_path = PathBuf::from(path);
-                self.manager.write_file(&file_path, content).await
+                self.manager
+                    .write_file(&file_path, content, expected_hash)
+                    .await
             }
             WriteMode::Append => {
                 let existing = self.read_file(path).await.unwrap_or_default();
@@ -86,13 +89,18 @@ impl FileTools {
                     format!("{}\n{}", existing, content)
                 };
                 let file_path = PathBuf::from(path);
-                self.manager.write_file(&file_path, &combined).await
+                self.manager
+                    .write_file(&file_path, &combined, expected_hash)
+                    .await
             }
             WriteMode::Prepend => {
                 let existing = self.read_file(path).await.unwrap_or_default();
                 if existing.is_empty() {
                     let file_path = PathBuf::from(path);
-                    return self.manager.write_file(&file_path, content).await;
+                    return self
+                        .manager
+                        .write_file(&file_path, content, expected_hash)
+                        .await;
                 }
 
                 // If existing file has frontmatter, insert new content after it
@@ -114,14 +122,16 @@ impl FileTools {
                     format!("{}\n{}", content, existing)
                 };
                 let file_path = PathBuf::from(path);
-                self.manager.write_file(&file_path, &combined).await
+                self.manager
+                    .write_file(&file_path, &combined, expected_hash)
+                    .await
             }
         }
     }
 
     /// Write a file to the vault (creates directories as needed) - backward compatible
     pub async fn write_file(&self, path: &str, content: &str) -> Result<()> {
-        self.write_file_with_mode(path, content, WriteMode::Overwrite)
+        self.write_file_with_mode(path, content, WriteMode::Overwrite, None)
             .await
     }
 
@@ -142,47 +152,39 @@ impl FileTools {
             .await
     }
 
-    /// Delete a file from the vault (with confirmation protection)
+    /// Delete a file from the vault (with audit trail and graph cleanup)
     pub async fn delete_file(&self, path: &str) -> Result<()> {
-        let file_path = self.manager.resolve_path(&PathBuf::from(path))?;
-
-        tokio::fs::remove_file(&file_path)
-            .await
-            .map_err(Error::io)?;
-
-        // Invalidate cache by writing empty then removing — or just let VaultManager handle it
-        // The cache will be refreshed on next read since the file no longer exists
-        Ok(())
+        self.manager.delete_file(&PathBuf::from(path), None).await
     }
 
-    /// Move a file within the vault
+    /// Delete a file with optional optimistic concurrency hash check
+    pub async fn delete_file_with_hash(
+        &self,
+        path: &str,
+        expected_hash: Option<&str>,
+    ) -> Result<()> {
+        self.manager
+            .delete_file(&PathBuf::from(path), expected_hash)
+            .await
+    }
+
+    /// Move a file within the vault (with audit trail and graph update)
     pub async fn move_file(&self, from: &str, to: &str) -> Result<()> {
-        let from_path = self.manager.resolve_path(&PathBuf::from(from))?;
-        let to_path = self.manager.resolve_path(&PathBuf::from(to))?;
+        self.manager
+            .move_file(&PathBuf::from(from), &PathBuf::from(to), None)
+            .await
+    }
 
-        // Create parent directory if needed
-        if let Some(parent) = to_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(Error::io)?;
-        }
-
-        // Perform rename (binary-safe)
-        match tokio::fs::rename(&from_path, &to_path).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
-                // Cross-filesystem move: copy then delete
-                tokio::fs::copy(&from_path, &to_path)
-                    .await
-                    .map_err(Error::io)?;
-                // Only delete source after successful copy
-                if let Err(del_err) = tokio::fs::remove_file(&from_path).await {
-                    // Copy succeeded but delete failed — clean up destination to avoid duplicates
-                    let _ = tokio::fs::remove_file(&to_path).await;
-                    return Err(Error::io(del_err));
-                }
-                Ok(())
-            }
-            Err(e) => Err(Error::io(e)),
-        }
+    /// Move a file with optional optimistic concurrency hash check
+    pub async fn move_file_with_hash(
+        &self,
+        from: &str,
+        to: &str,
+        expected_hash: Option<&str>,
+    ) -> Result<()> {
+        self.manager
+            .move_file(&PathBuf::from(from), &PathBuf::from(to), expected_hash)
+            .await
     }
 
     /// Copy a file within the vault

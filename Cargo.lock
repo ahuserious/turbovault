@@ -4512,7 +4512,7 @@ dependencies = [
 
 [[package]]
 name = "turbovault"
-version = "1.2.8"
+version = "1.2.9"
 dependencies = [
  "anyhow",
  "clap",
@@ -4530,14 +4530,32 @@ dependencies = [
  "tracing-subscriber",
  "turbomcp",
  "turbomcp-server",
+ "turbovault-audit",
  "turbovault-core",
  "turbovault-tools",
  "turbovault-vault",
 ]
 
 [[package]]
+name = "turbovault-audit"
+version = "1.2.9"
+dependencies = [
+ "chrono",
+ "log",
+ "serde",
+ "serde_json",
+ "sha2",
+ "similar",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "turbovault-core",
+ "uuid",
+]
+
+[[package]]
 name = "turbovault-batch"
-version = "1.2.8"
+version = "1.2.9"
 dependencies = [
  "chrono",
  "serde",
@@ -4551,7 +4569,7 @@ dependencies = [
 
 [[package]]
 name = "turbovault-core"
-version = "1.2.8"
+version = "1.2.9"
 dependencies = [
  "chrono",
  "log",
@@ -4568,7 +4586,7 @@ dependencies = [
 
 [[package]]
 name = "turbovault-export"
-version = "1.2.8"
+version = "1.2.9"
 dependencies = [
  "chrono",
  "serde",
@@ -4580,7 +4598,7 @@ dependencies = [
 
 [[package]]
 name = "turbovault-graph"
-version = "1.2.8"
+version = "1.2.9"
 dependencies = [
  "anyhow",
  "dashmap 5.5.3",
@@ -4595,7 +4613,7 @@ dependencies = [
 
 [[package]]
 name = "turbovault-parser"
-version = "1.2.8"
+version = "1.2.9"
 dependencies = [
  "insta",
  "log",
@@ -4610,7 +4628,7 @@ dependencies = [
 
 [[package]]
 name = "turbovault-tools"
-version = "1.2.8"
+version = "1.2.9"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4619,12 +4637,14 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "shellexpand",
+ "similar",
  "tantivy",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
  "turbomcp",
+ "turbovault-audit",
  "turbovault-batch",
  "turbovault-core",
  "turbovault-export",
@@ -4636,7 +4656,7 @@ dependencies = [
 
 [[package]]
 name = "turbovault-vault"
-version = "1.2.8"
+version = "1.2.9"
 dependencies = [
  "anyhow",
  "dashmap 5.5.3",
@@ -4653,6 +4673,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "turbovault-audit",
  "turbovault-core",
  "turbovault-graph",
  "turbovault-parser",

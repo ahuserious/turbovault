@@ -202,7 +202,9 @@ impl MetadataTools {
 
         // Reconstruct and write
         let new_content = reconstruct_content(Some(&final_fm), &body);
-        self.manager.write_file(&file_path, &new_content).await?;
+        self.manager
+            .write_file(&file_path, &new_content, None)
+            .await?;
 
         Ok(json!({
             "path": path,
@@ -295,7 +297,9 @@ impl MetadataTools {
                 );
 
                 let new_content = reconstruct_content(Some(&fm), &body);
-                self.manager.write_file(&file_path, &new_content).await?;
+                self.manager
+                    .write_file(&file_path, &new_content, None)
+                    .await?;
 
                 Ok(json!({
                     "path": path,
@@ -340,7 +344,9 @@ impl MetadataTools {
                 );
 
                 let new_content = reconstruct_content(Some(&fm), &body);
-                self.manager.write_file(&file_path, &new_content).await?;
+                self.manager
+                    .write_file(&file_path, &new_content, None)
+                    .await?;
 
                 Ok(json!({
                     "path": path,

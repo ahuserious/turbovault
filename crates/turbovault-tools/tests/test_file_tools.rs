@@ -477,6 +477,7 @@ async fn test_write_mode_append_empty_file() {
             "empty.md",
             "appended content",
             turbovault_tools::WriteMode::Append,
+            None,
         )
         .await
         .unwrap();
@@ -492,7 +493,12 @@ async fn test_write_mode_append_nonempty_file() {
 
     tools.write_file("existing.md", "line1").await.unwrap();
     tools
-        .write_file_with_mode("existing.md", "line2", turbovault_tools::WriteMode::Append)
+        .write_file_with_mode(
+            "existing.md",
+            "line2",
+            turbovault_tools::WriteMode::Append,
+            None,
+        )
         .await
         .unwrap();
 
@@ -510,7 +516,12 @@ async fn test_write_mode_prepend_with_frontmatter() {
         .await
         .unwrap();
     tools
-        .write_file_with_mode("fm.md", "INSERTED", turbovault_tools::WriteMode::Prepend)
+        .write_file_with_mode(
+            "fm.md",
+            "INSERTED",
+            turbovault_tools::WriteMode::Prepend,
+            None,
+        )
         .await
         .unwrap();
 
@@ -534,7 +545,12 @@ async fn test_write_mode_prepend_without_frontmatter() {
         .await
         .unwrap();
     tools
-        .write_file_with_mode("nofm.md", "INSERTED", turbovault_tools::WriteMode::Prepend)
+        .write_file_with_mode(
+            "nofm.md",
+            "INSERTED",
+            turbovault_tools::WriteMode::Prepend,
+            None,
+        )
         .await
         .unwrap();
 
@@ -554,6 +570,7 @@ async fn test_write_mode_prepend_empty_file() {
             "empty.md",
             "new content",
             turbovault_tools::WriteMode::Prepend,
+            None,
         )
         .await
         .unwrap();
@@ -577,6 +594,7 @@ async fn test_write_mode_prepend_malformed_frontmatter() {
             "malformed.md",
             "INSERTED",
             turbovault_tools::WriteMode::Prepend,
+            None,
         )
         .await
         .unwrap();

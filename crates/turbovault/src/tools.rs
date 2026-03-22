@@ -6,13 +6,15 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use turbomcp::prelude::*;
+use turbovault_audit::{AuditFilter, AuditLog, OperationType, SnapshotStore};
 use turbovault_core::ServerConfig;
 use turbovault_core::error::Error;
 use turbovault_core::prelude::MultiVaultManager;
 use turbovault_tools::{
-    AnalysisTools, BatchOperation, BatchTools, ExportTools, FileTools, GraphTools, MetadataTools,
-    RelationshipTools, SearchEngine, SearchQuery, SearchTools, TemplateEngine, VaultLifecycleTools,
-    WriteMode, obsidian_uri,
+    AnalysisTools, AuditTools, BatchOperation, BatchTools, DiffTools, DuplicateTools, ExportTools,
+    FileTools, GraphTools, MetadataTools, QualityTools, RelationshipTools, SearchEngine,
+    SearchQuery, SearchTools, SimilarityEngine, TemplateEngine, VaultLifecycleTools, WriteMode,
+    obsidian_uri,
 };
 use turbovault_vault::VaultManager;
 
@@ -153,6 +155,12 @@ pub struct ObsidianMcpServer {
     vault_managers: Arc<RwLock<HashMap<String, Arc<VaultManager>>>>,
     /// Cache for persisting vault state across server restarts (project-aware)
     persistent_cache: Arc<RwLock<Option<turbovault_core::cache::VaultCache>>>,
+    /// Audit logs per vault (keyed by vault name)
+    audit_logs: Arc<RwLock<HashMap<String, Arc<AuditLog>>>>,
+    /// Snapshot stores per vault (keyed by vault name)
+    snapshot_stores: Arc<RwLock<HashMap<String, Arc<SnapshotStore>>>>,
+    /// Similarity engines per vault (keyed by vault name, lazy-initialized)
+    similarity_engines: Arc<RwLock<HashMap<String, Arc<SimilarityEngine>>>>,
 }
 
 impl ObsidianMcpServer {
@@ -167,6 +175,9 @@ impl ObsidianMcpServer {
             multi_vault_mgr: Arc::new(mgr),
             vault_managers: Arc::new(RwLock::new(HashMap::new())),
             persistent_cache: Arc::new(RwLock::new(None)),
+            audit_logs: Arc::new(RwLock::new(HashMap::new())),
+            snapshot_stores: Arc::new(RwLock::new(HashMap::new())),
+            similarity_engines: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -205,7 +216,7 @@ impl Default for ObsidianMcpServer {
     }
 }
 
-#[turbomcp::server(name = "obsidian-vault", version = "1.2.7")]
+#[turbomcp::server(name = "obsidian-vault", version = "1.2.9")]
 impl ObsidianMcpServer {
     /// Get a vault manager for the currently active vault (cached)
     async fn get_active_vault_manager(&self) -> McpResult<Arc<VaultManager>> {
@@ -231,8 +242,32 @@ impl ObsidianMcpServer {
         vault_config.is_default = true; // Mark as default so VaultManager::new() can find it
         server_config.vaults = vec![vault_config];
 
-        let manager = VaultManager::new(server_config)
+        let mut manager = VaultManager::new(server_config)
             .map_err(|e| McpError::internal(format!("Failed to create vault manager: {}", e)))?;
+
+        // Initialize audit log for this vault
+        let vault_path = manager.vault_path().clone();
+        match AuditLog::new(&vault_path).await {
+            Ok(audit_log) => {
+                let audit_log = Arc::new(audit_log);
+                let snapshot_store =
+                    Arc::new(SnapshotStore::new(audit_log.snapshot_dir().to_path_buf()));
+                manager.set_audit_log(audit_log.clone(), snapshot_store.clone());
+
+                // Cache audit log and snapshot store
+                let mut logs = self.audit_logs.write().await;
+                logs.insert(vault_name.clone(), audit_log);
+                let mut stores = self.snapshot_stores.write().await;
+                stores.insert(vault_name.clone(), snapshot_store);
+            }
+            Err(e) => {
+                log::warn!(
+                    "Failed to initialize audit log for {}: {} (audit trail disabled)",
+                    vault_name,
+                    e
+                );
+            }
+        }
 
         // Initialize vault (scan files and build link graph) on first access
         manager
@@ -249,6 +284,61 @@ impl ObsidianMcpServer {
         }
 
         Ok(manager)
+    }
+
+    /// Get audit tools for the active vault
+    async fn get_audit_tools(&self) -> McpResult<AuditTools> {
+        let vault_name = self.get_active_vault_name().await?;
+        // Ensure vault manager exists (triggers audit log creation)
+        let _ = self.get_active_vault_manager().await?;
+
+        let logs = self.audit_logs.read().await;
+        let stores = self.snapshot_stores.read().await;
+
+        let audit_log = logs.get(&vault_name).cloned().ok_or_else(|| {
+            McpError::internal("Audit log not available for this vault".to_string())
+        })?;
+        let snapshot_store = stores
+            .get(&vault_name)
+            .cloned()
+            .ok_or_else(|| McpError::internal("Snapshot store not available".to_string()))?;
+
+        Ok(AuditTools::new(audit_log, snapshot_store))
+    }
+
+    /// Invalidate cached similarity engine for the active vault (call after any write operation)
+    async fn invalidate_similarity_cache(&self) {
+        if let Ok(vault_name) = self.get_active_vault_name().await {
+            let mut cache = self.similarity_engines.write().await;
+            cache.remove(&vault_name);
+        }
+    }
+
+    /// Get or build similarity engine for the active vault
+    async fn get_similarity_engine(&self) -> McpResult<Arc<SimilarityEngine>> {
+        let vault_name = self.get_active_vault_name().await?;
+
+        // Check cache
+        {
+            let cache = self.similarity_engines.read().await;
+            if let Some(engine) = cache.get(&vault_name) {
+                return Ok(engine.clone());
+            }
+        }
+
+        // Build new engine
+        let manager = self.get_active_vault_manager().await?;
+        let engine = SimilarityEngine::new(manager)
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to build similarity engine: {}", e)))?;
+        let engine = Arc::new(engine);
+
+        {
+            let mut cache = self.similarity_engines.write().await;
+            cache.insert(vault_name, engine.clone());
+        }
+
+        Ok(engine)
     }
 
     /// Helper to get active vault name
@@ -407,26 +497,28 @@ impl ObsidianMcpServer {
 
     /// Write or update a note with optional mode (overwrite, append, prepend)
     #[tool(
-        description = "Write a note in active vault with mode control: 'overwrite' (default) replaces entire file, 'append' adds to end, 'prepend' adds after frontmatter",
-        usage = "Use for creating new notes, replacing existing ones, or appending/prepending content. Append mode is ideal for daily notes and journals. Prepend inserts after frontmatter if present. Accepts Obsidian Flavored Markdown. For targeted edits, use edit_note instead",
+        description = "Write a note in active vault with mode control: 'overwrite' (default) replaces entire file, 'append' adds to end, 'prepend' adds after frontmatter. Supports optimistic concurrency: pass expected_hash (from read_note) to prevent overwriting concurrent changes",
+        usage = "Use for creating new notes, replacing existing ones, or appending/prepending content. Append mode is ideal for daily notes and journals. Prepend inserts after frontmatter if present. Accepts Obsidian Flavored Markdown. For targeted edits, use edit_note instead. Pass expected_hash to detect concurrent modifications",
         performance = "Moderate (<50ms typical). Includes filesystem write and link graph update",
         related = ["read_note", "edit_note", "create_from_template"],
-        examples = ["mode: overwrite (default)", "mode: append (add to end)", "mode: prepend (add after frontmatter)"]
+        examples = ["mode: overwrite (default)", "mode: append (add to end)", "mode: prepend (add after frontmatter)", "expected_hash: <hash from read_note>"]
     )]
     async fn write_note(
         &self,
         path: String,
         content: String,
         mode: Option<String>,
+        expected_hash: Option<String>,
     ) -> McpResult<serde_json::Value> {
         let (vault_name, manager) = self.get_vault_pair().await?;
         let write_mode = WriteMode::from_str_opt(mode.as_deref()).map_err(to_mcp_error)?;
         let tools = FileTools::new(manager);
         tools
-            .write_file_with_mode(&path, &content, write_mode)
+            .write_file_with_mode(&path, &content, write_mode, expected_hash.as_deref())
             .await
             .map_err(to_mcp_error)?;
 
+        self.invalidate_similarity_cache().await;
         let mode_str = mode.as_deref().unwrap_or("overwrite");
         StandardResponse::new(
             vault_name,
@@ -460,6 +552,7 @@ impl ObsidianMcpServer {
             .await
             .map_err(to_mcp_error)?;
 
+        self.invalidate_similarity_cache().await;
         StandardResponse::new(
             vault_name,
             "edit_note",
@@ -472,7 +565,7 @@ impl ObsidianMcpServer {
     /// Delete a note (confirmation-protected)
     #[tool(
         description = "Permanently delete a note from active vault (irreversible, confirmation-protected)",
-        usage = "Use to remove unwanted notes. REQUIRES confirm_path parameter matching path exactly to prevent accidental deletion. Removes file from filesystem and updates link graph. Any links to this note become broken links. Use get_backlinks first to understand impact",
+        usage = "Use to remove unwanted notes. REQUIRES confirm_path parameter matching path exactly to prevent accidental deletion. Removes file from filesystem and updates link graph. Any links to this note become broken links. Use get_backlinks first to understand impact. Pass expected_hash for concurrency protection",
         performance = "Fast (<20ms typical). Includes filesystem delete and link graph update",
         related = ["get_backlinks", "get_broken_links", "move_note"],
         examples = ["path: drafts/old-idea.md, confirm_path: drafts/old-idea.md"]
@@ -481,6 +574,7 @@ impl ObsidianMcpServer {
         &self,
         path: String,
         confirm_path: String,
+        expected_hash: Option<String>,
     ) -> McpResult<serde_json::Value> {
         // Safety: confirm_path must match path exactly
         if path != confirm_path {
@@ -492,8 +586,12 @@ impl ObsidianMcpServer {
 
         let (vault_name, manager) = self.get_vault_pair().await?;
         let tools = FileTools::new(manager);
-        tools.delete_file(&path).await.map_err(to_mcp_error)?;
+        tools
+            .delete_file_with_hash(&path, expected_hash.as_deref())
+            .await
+            .map_err(to_mcp_error)?;
 
+        self.invalidate_similarity_cache().await;
         StandardResponse::new(
             vault_name,
             "delete_note",
@@ -506,16 +604,25 @@ impl ObsidianMcpServer {
     /// Move or rename a note
     #[tool(
         description = "Move or rename a note within active vault. Does NOT update wikilinks — use get_backlinks first to assess impact",
-        usage = "Use to reorganize vault structure or rename notes. This performs a filesystem move only. Links pointing to the old path will become broken. Always call get_backlinks before moving to understand impact, then manually update references if needed",
+        usage = "Use to reorganize vault structure or rename notes. This performs a filesystem move only. Links pointing to the old path will become broken. Always call get_backlinks before moving to understand impact, then manually update references if needed. Pass expected_hash for concurrency protection",
         performance = "Fast (<20ms typical). Filesystem rename, falls back to copy+delete for cross-filesystem moves",
         related = ["get_backlinks", "get_forward_links", "search"],
         examples = []
     )]
-    async fn move_note(&self, from: String, to: String) -> McpResult<serde_json::Value> {
+    async fn move_note(
+        &self,
+        from: String,
+        to: String,
+        expected_hash: Option<String>,
+    ) -> McpResult<serde_json::Value> {
         let (vault_name, manager) = self.get_vault_pair().await?;
         let tools = FileTools::new(manager);
-        tools.move_file(&from, &to).await.map_err(to_mcp_error)?;
+        tools
+            .move_file_with_hash(&from, &to, expected_hash.as_deref())
+            .await
+            .map_err(to_mcp_error)?;
 
+        self.invalidate_similarity_cache().await;
         StandardResponse::new(
             vault_name,
             "move_note",
@@ -1091,6 +1198,7 @@ impl ObsidianMcpServer {
             .await
             .map_err(to_mcp_error)?;
 
+        self.invalidate_similarity_cache().await;
         let response = StandardResponse::new(
             vault_name,
             "create_from_template",
@@ -1402,6 +1510,7 @@ impl ObsidianMcpServer {
         let tools = BatchTools::new(manager);
         let result = tools.batch_execute(ops).await.map_err(to_mcp_error)?;
 
+        self.invalidate_similarity_cache().await;
         let response = StandardResponse::new(
             vault_name,
             "batch_execute",
@@ -1618,6 +1727,7 @@ impl ObsidianMcpServer {
             .await
             .map_err(to_mcp_error)?;
 
+        self.invalidate_similarity_cache().await;
         StandardResponse::new(vault_name, "update_frontmatter", result)
             .with_next_steps(&["read_note", "query_metadata"])
             .to_json()
@@ -1649,6 +1759,7 @@ impl ObsidianMcpServer {
             .await
             .map_err(to_mcp_error)?;
 
+        self.invalidate_similarity_cache().await;
         StandardResponse::new(vault_name, "manage_tags", result)
             .with_next_steps(&["update_frontmatter", "query_metadata"])
             .to_json()
@@ -1696,6 +1807,7 @@ impl ObsidianMcpServer {
         to: String,
         confirm_from: String,
         confirm_to: String,
+        expected_hash: Option<String>,
     ) -> McpResult<serde_json::Value> {
         // Safety: confirmations must match
         if from != confirm_from {
@@ -1713,8 +1825,12 @@ impl ObsidianMcpServer {
 
         let (vault_name, manager) = self.get_vault_pair().await?;
         let tools = FileTools::new(manager);
-        tools.move_file(&from, &to).await.map_err(to_mcp_error)?;
+        tools
+            .move_file_with_hash(&from, &to, expected_hash.as_deref())
+            .await
+            .map_err(to_mcp_error)?;
 
+        self.invalidate_similarity_cache().await;
         StandardResponse::new(
             vault_name,
             "move_file",
@@ -1961,5 +2077,443 @@ impl ObsidianMcpServer {
                 "quick_ref_tool": "get_ofm_quick_ref"
             }
         }))
+    }
+
+    // ─── DIFF TOOLS ──────────────────────────────────────────────────
+
+    #[tool(
+        description = "Compare two notes side-by-side showing unified diff, line-level and word-level changes, and similarity score",
+        usage = "Use to understand differences between two notes, find duplicate content, or review changes. Returns unified diff format with added/removed/changed line counts and word-level inline changes",
+        performance = "Fast (<50ms typical). Uses line-level then word-level diff for changed lines",
+        related = ["read_note", "find_duplicates", "compare_notes"],
+        examples = ["diff_notes(left='projects/plan-v1.md', right='projects/plan-v2.md')"]
+    )]
+    async fn diff_notes(&self, left: String, right: String) -> McpResult<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let (vault_name, manager) = self.get_vault_pair().await?;
+        let tools = DiffTools::new(manager);
+        let result = tools
+            .diff_notes(&left, &right)
+            .await
+            .map_err(to_mcp_error)?;
+        StandardResponse::new(
+            &vault_name,
+            "diff_notes",
+            serde_json::to_value(&result).map_err(|e| McpError::internal(e.to_string()))?,
+        )
+        .with_duration(start.elapsed().as_millis() as u64)
+        .with_next_steps(&["read_note", "edit_note", "compare_notes"])
+        .to_json()
+    }
+
+    #[tool(
+        description = "Compare current note with a previous version from the audit trail",
+        usage = "Use to see what changed in a note over time. Specify operation_id from audit_log to identify the version to compare against",
+        performance = "Fast (<50ms for diff, plus audit snapshot read time)",
+        related = ["audit_log", "rollback_preview", "diff_notes"],
+        examples = ["diff_note_version(path='notes/todo.md', operation_id='abc-123')"]
+    )]
+    async fn diff_note_version(
+        &self,
+        path: String,
+        operation_id: String,
+    ) -> McpResult<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let (vault_name, manager) = self.get_vault_pair().await?;
+        let audit_tools = self.get_audit_tools().await?;
+
+        // Get the snapshot from the audit entry
+        let entry = audit_tools
+            .audit_log()
+            .get_entry(&operation_id)
+            .await
+            .map_err(to_mcp_error)?
+            .ok_or_else(|| {
+                McpError::internal(format!("Audit entry not found: {}", operation_id))
+            })?;
+
+        let snapshot_id = entry
+            .before_snapshot_id
+            .as_ref()
+            .or(entry.after_snapshot_id.as_ref())
+            .ok_or_else(|| {
+                McpError::internal("No snapshot available for this operation".to_string())
+            })?;
+
+        let snapshot_content = audit_tools
+            .snapshot_store()
+            .retrieve(snapshot_id)
+            .await
+            .map_err(to_mcp_error)?;
+
+        // Read current content
+        let current_content = manager
+            .read_file(&std::path::PathBuf::from(&path))
+            .await
+            .map_err(to_mcp_error)?;
+
+        let result = DiffTools::diff_content(
+            &snapshot_content,
+            &current_content,
+            &format!(
+                "{} (version {})",
+                path,
+                &operation_id[..8.min(operation_id.len())]
+            ),
+            &format!("{} (current)", path),
+        );
+
+        StandardResponse::new(
+            &vault_name,
+            "diff_note_version",
+            serde_json::to_value(&result).map_err(|e| McpError::internal(e.to_string()))?,
+        )
+        .with_duration(start.elapsed().as_millis() as u64)
+        .with_next_steps(&["audit_log", "rollback_note", "read_note"])
+        .to_json()
+    }
+
+    // ─── QUALITY TOOLS ───────────────────────────────────────────────
+
+    #[tool(
+        description = "Evaluate note quality across readability, structure, completeness, and staleness dimensions (0-100 score per dimension plus composite)",
+        usage = "Use to assess individual note quality and get specific improvement recommendations. Examines heading hierarchy, link density, vocabulary diversity, metadata completeness, and modification recency",
+        performance = "Fast (<100ms per note). Parses content and checks graph for backlinks",
+        related = ["vault_quality_report", "find_stale_notes", "full_health_analysis"],
+        examples = ["evaluate_note_quality(path='projects/research.md')"]
+    )]
+    async fn evaluate_note_quality(&self, path: String) -> McpResult<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let (vault_name, manager) = self.get_vault_pair().await?;
+        let tools = QualityTools::new(manager);
+        let result = tools.evaluate_note(&path).await.map_err(to_mcp_error)?;
+        StandardResponse::new(
+            &vault_name,
+            "evaluate_note_quality",
+            serde_json::to_value(&result).map_err(|e| McpError::internal(e.to_string()))?,
+        )
+        .with_duration(start.elapsed().as_millis() as u64)
+        .with_next_steps(&["vault_quality_report", "edit_note", "find_stale_notes"])
+        .to_json()
+    }
+
+    #[tool(
+        description = "Generate vault-wide quality report with score distribution, dimension averages, lowest/highest quality notes, and recommendations",
+        usage = "Use for vault-wide quality assessment. Identifies notes needing improvement and provides aggregate metrics across readability, structure, completeness, and staleness",
+        performance = "Moderate to slow (500ms-5s depending on vault size). Evaluates all notes",
+        related = ["evaluate_note_quality", "find_stale_notes", "full_health_analysis", "explain_vault"],
+        examples = ["vault_quality_report()", "vault_quality_report(bottom_n=20)"]
+    )]
+    async fn vault_quality_report(&self, bottom_n: Option<usize>) -> McpResult<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let (vault_name, manager) = self.get_vault_pair().await?;
+        let tools = QualityTools::new(manager);
+        let result = tools
+            .vault_quality_report(bottom_n.unwrap_or(10))
+            .await
+            .map_err(to_mcp_error)?;
+        StandardResponse::new(
+            &vault_name,
+            "vault_quality_report",
+            serde_json::to_value(&result).map_err(|e| McpError::internal(e.to_string()))?,
+        )
+        .with_count(result.total_notes)
+        .with_duration(start.elapsed().as_millis() as u64)
+        .with_next_steps(&["evaluate_note_quality", "find_stale_notes"])
+        .to_json()
+    }
+
+    #[tool(
+        description = "Find notes that have not been updated recently, sorted by staleness (most stale first)",
+        usage = "Use to identify neglected content that may need review, updating, or archiving. Configurable threshold in days and result limit",
+        performance = "Moderate (200ms-2s depending on vault size). Checks file modification times",
+        related = ["evaluate_note_quality", "vault_quality_report", "query_metadata"],
+        examples = ["find_stale_notes(threshold_days=90)", "find_stale_notes(threshold_days=30, limit=20)"]
+    )]
+    async fn find_stale_notes(
+        &self,
+        threshold_days: Option<u64>,
+        limit: Option<usize>,
+    ) -> McpResult<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let (vault_name, manager) = self.get_vault_pair().await?;
+        let tools = QualityTools::new(manager);
+        let result = tools
+            .find_stale_notes(threshold_days.unwrap_or(90), limit.unwrap_or(20))
+            .await
+            .map_err(to_mcp_error)?;
+        let count = result.len();
+        StandardResponse::new(
+            &vault_name,
+            "find_stale_notes",
+            serde_json::to_value(&result).map_err(|e| McpError::internal(e.to_string()))?,
+        )
+        .with_count(count)
+        .with_duration(start.elapsed().as_millis() as u64)
+        .with_next_steps(&["evaluate_note_quality", "read_note", "edit_note"])
+        .to_json()
+    }
+
+    // ─── SIMILARITY TOOLS ────────────────────────────────────────────
+
+    #[tool(
+        description = "Find notes semantically similar to a query using TF-IDF cosine similarity (finds conceptual matches beyond exact keyword overlap)",
+        usage = "Use when keyword search returns too few results or you want conceptual similarity. Returns similarity scores (0-1) and shared terms for explainability. More sophisticated than keyword search",
+        performance = "Moderate (<500ms for 10k notes). Builds TF-IDF vectors on first call, cached for subsequent queries",
+        related = ["search", "find_similar_notes", "recommend_related", "advanced_search"],
+        examples = ["semantic_search(query='distributed systems architecture')", "semantic_search(query='machine learning concepts', limit=20)"]
+    )]
+    async fn semantic_search(
+        &self,
+        query: String,
+        limit: Option<usize>,
+    ) -> McpResult<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let vault_name = self.get_active_vault_name().await?;
+        let engine = self.get_similarity_engine().await?;
+        let results = engine.semantic_search(&query, limit.unwrap_or(10));
+        let count = results.len();
+        StandardResponse::new(
+            &vault_name,
+            "semantic_search",
+            serde_json::to_value(&results).map_err(|e| McpError::internal(e.to_string()))?,
+        )
+        .with_count(count)
+        .with_duration(start.elapsed().as_millis() as u64)
+        .with_next_steps(&["read_note", "find_similar_notes", "advanced_search"])
+        .to_json()
+    }
+
+    #[tool(
+        description = "Find notes most similar in content to a specific note using TF-IDF cosine similarity",
+        usage = "Use to discover related notes for linking, find candidates for merging, or identify thematic clusters. More content-aware than graph-based get_related_notes",
+        performance = "Moderate (<500ms for 10k notes). Uses pre-built TF-IDF vectors",
+        related = ["semantic_search", "recommend_related", "get_related_notes", "find_duplicates"],
+        examples = ["find_similar_notes(path='projects/research.md')", "find_similar_notes(path='ideas/concept.md', limit=20)"]
+    )]
+    async fn find_similar_notes(
+        &self,
+        path: String,
+        limit: Option<usize>,
+    ) -> McpResult<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let vault_name = self.get_active_vault_name().await?;
+        let engine = self.get_similarity_engine().await?;
+        let results = engine.find_similar_notes(&path, limit.unwrap_or(10));
+        let count = results.len();
+        StandardResponse::new(
+            &vault_name,
+            "find_similar_notes",
+            serde_json::to_value(&results).map_err(|e| McpError::internal(e.to_string()))?,
+        )
+        .with_count(count)
+        .with_duration(start.elapsed().as_millis() as u64)
+        .with_next_steps(&["read_note", "semantic_search", "get_backlinks"])
+        .to_json()
+    }
+
+    // ─── DUPLICATE TOOLS ─────────────────────────────────────────────
+
+    #[tool(
+        description = "Find near-duplicate notes across vault using SimHash fingerprinting and TF-IDF cosine similarity verification",
+        usage = "Use to identify redundant content, merge candidates, or detect copied notes. Default threshold 0.8 catches close duplicates; lower to 0.6 for looser matching. Two-stage: fast SimHash filtering then precise verification",
+        performance = "Moderate (<2s for 10k notes). SimHash O(N^2) candidate filtering then TF-IDF verification",
+        related = ["compare_notes", "find_similar_notes", "diff_notes"],
+        examples = ["find_duplicates()", "find_duplicates(threshold=0.6, limit=50)"]
+    )]
+    async fn find_duplicates(
+        &self,
+        threshold: Option<f64>,
+        limit: Option<usize>,
+    ) -> McpResult<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let (vault_name, manager) = self.get_vault_pair().await?;
+        let tools = DuplicateTools::new(manager);
+        let result = tools
+            .find_duplicates(threshold.unwrap_or(0.8), limit.unwrap_or(20))
+            .await
+            .map_err(to_mcp_error)?;
+        let count = result.len();
+        StandardResponse::new(
+            &vault_name,
+            "find_duplicates",
+            serde_json::to_value(&result).map_err(|e| McpError::internal(e.to_string()))?,
+        )
+        .with_count(count)
+        .with_duration(start.elapsed().as_millis() as u64)
+        .with_next_steps(&["compare_notes", "diff_notes", "read_note"])
+        .to_json()
+    }
+
+    #[tool(
+        description = "Compare two specific notes showing similarity score, shared terms, diff summary, and actionable recommendation",
+        usage = "Use to assess whether two notes should be merged, linked, or kept separate. Returns similarity score (0-1), shared vocabulary, line-level diff statistics, and a recommendation",
+        performance = "Moderate (<500ms). Builds TF-IDF vectors and computes diff",
+        related = ["find_duplicates", "diff_notes", "find_similar_notes"],
+        examples = ["compare_notes(left='projects/plan-v1.md', right='projects/plan-v2.md')"]
+    )]
+    async fn compare_notes(&self, left: String, right: String) -> McpResult<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let (vault_name, manager) = self.get_vault_pair().await?;
+        let tools = DuplicateTools::new(manager);
+        let result = tools
+            .compare_notes(&left, &right)
+            .await
+            .map_err(to_mcp_error)?;
+        StandardResponse::new(
+            &vault_name,
+            "compare_notes",
+            serde_json::to_value(&result).map_err(|e| McpError::internal(e.to_string()))?,
+        )
+        .with_duration(start.elapsed().as_millis() as u64)
+        .with_next_steps(&["diff_notes", "read_note", "find_duplicates"])
+        .to_json()
+    }
+
+    // ─── AUDIT TOOLS ─────────────────────────────────────────────────
+
+    #[tool(
+        description = "View operation history for the active vault with optional filters by path, operation type (CREATE/UPDATE/DELETE/MOVE), and result limit",
+        usage = "Use to review what changed in the vault, when, and get operation IDs for rollback. Returns chronological entries (newest first) with operation IDs, timestamps, paths, and content hashes",
+        performance = "Fast (<100ms typical). Reads from append-only JSONL log file",
+        related = ["rollback_note", "rollback_preview", "audit_stats", "diff_note_version"],
+        examples = ["audit_log()", "audit_log(path='projects/', limit=20)", "audit_log(operation='DELETE')"]
+    )]
+    async fn audit_log(
+        &self,
+        path: Option<String>,
+        operation: Option<String>,
+        limit: Option<usize>,
+    ) -> McpResult<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let vault_name = self.get_active_vault_name().await?;
+        let audit_tools = self.get_audit_tools().await?;
+
+        let mut filter = AuditFilter::new().with_limit(limit.unwrap_or(50));
+        if let Some(p) = path {
+            filter = filter.with_path(p);
+        }
+        if let Some(op) = operation {
+            let op_type = match op.to_uppercase().as_str() {
+                "CREATE" => OperationType::Create,
+                "UPDATE" => OperationType::Update,
+                "DELETE" => OperationType::Delete,
+                "MOVE" => OperationType::Move,
+                "ROLLBACK" => OperationType::Rollback,
+                _ => {
+                    return Err(McpError::internal(format!(
+                        "Unknown operation type: {}. Use CREATE, UPDATE, DELETE, MOVE, or ROLLBACK",
+                        op
+                    )));
+                }
+            };
+            filter = filter.with_operation(op_type);
+        }
+
+        let entries = audit_tools.query_log(&filter).await.map_err(to_mcp_error)?;
+        let count = entries.len();
+        StandardResponse::new(
+            &vault_name,
+            "audit_log",
+            serde_json::to_value(&entries).map_err(|e| McpError::internal(e.to_string()))?,
+        )
+        .with_count(count)
+        .with_duration(start.elapsed().as_millis() as u64)
+        .with_next_steps(&["rollback_preview", "diff_note_version", "audit_stats"])
+        .to_json()
+    }
+
+    #[tool(
+        description = "Preview what a rollback would change without applying it (dry run). Shows unified diff between current content and rollback target",
+        usage = "Always use before rollback_note to verify the change. Returns whether the rollback would create, delete, or modify the file, plus a diff preview",
+        performance = "Fast (<50ms). Read-only operation",
+        related = ["rollback_note", "audit_log", "diff_note_version"],
+        examples = ["rollback_preview(operation_id='abc-123-def-456')"]
+    )]
+    async fn rollback_preview(&self, operation_id: String) -> McpResult<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let (vault_name, manager) = self.get_vault_pair().await?;
+        let audit_tools = self.get_audit_tools().await?;
+        let vault_path = manager.vault_path().clone();
+        let result = audit_tools
+            .rollback_preview(&operation_id, &vault_path)
+            .await
+            .map_err(to_mcp_error)?;
+        let mut response = StandardResponse::new(
+            &vault_name,
+            "rollback_preview",
+            serde_json::to_value(&result).map_err(|e| McpError::internal(e.to_string()))?,
+        )
+        .with_duration(start.elapsed().as_millis() as u64)
+        .with_next_steps(&["rollback_note", "audit_log"]);
+        for w in &result.warnings {
+            response = response.with_warning(w.clone());
+        }
+        response.to_json()
+    }
+
+    #[tool(
+        description = "Restore a note to its state before a specific operation (identified by operation_id from audit_log)",
+        usage = "Use to undo unwanted changes. The rollback itself is recorded in the audit trail. Use rollback_preview first to verify. Cannot roll back MOVE or ROLLBACK operations",
+        performance = "Moderate (<100ms). Reads snapshot, writes file atomically, records new audit entry",
+        related = ["rollback_preview", "audit_log", "diff_note_version"],
+        examples = ["rollback_note(operation_id='abc-123-def-456')"]
+    )]
+    async fn rollback_note(&self, operation_id: String) -> McpResult<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let (vault_name, manager) = self.get_vault_pair().await?;
+        let audit_tools = self.get_audit_tools().await?;
+        let vault_path = manager.vault_path().clone();
+        let result = audit_tools
+            .rollback_execute(&operation_id, &vault_path)
+            .await
+            .map_err(to_mcp_error)?;
+
+        // Invalidate similarity engine cache since vault content changed
+        self.invalidate_similarity_cache().await;
+
+        // Re-parse the rolled-back file so the link graph reflects the restored content
+        let restored_path = std::path::PathBuf::from(&result.path);
+        let full_path = vault_path.join(&restored_path);
+        if full_path.exists()
+            && tokio::fs::read_to_string(&full_path).await.is_ok()
+            && let Ok(vault_file) = manager.parse_file(&restored_path).await
+        {
+            let graph = manager.link_graph();
+            let mut graph_write = graph.write().await;
+            let _ = graph_write.add_file(&vault_file);
+            let _ = graph_write.update_links(&vault_file);
+        }
+
+        StandardResponse::new(
+            &vault_name,
+            "rollback_note",
+            serde_json::to_value(&result).map_err(|e| McpError::internal(e.to_string()))?,
+        )
+        .with_duration(start.elapsed().as_millis() as u64)
+        .with_next_steps(&["read_note", "audit_log"])
+        .to_json()
+    }
+
+    #[tool(
+        description = "Get audit trail statistics including operation counts by type, total snapshot storage used, and time range of recorded operations",
+        usage = "Use for vault auditing overview. Shows operation breakdown (CREATE/UPDATE/DELETE/MOVE) and total snapshot disk usage",
+        performance = "Fast (<50ms). Aggregates from log file",
+        related = ["audit_log", "explain_vault", "vault_quality_report"],
+        examples = ["audit_stats()"]
+    )]
+    async fn audit_stats(&self) -> McpResult<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let vault_name = self.get_active_vault_name().await?;
+        let audit_tools = self.get_audit_tools().await?;
+        let result = audit_tools.stats().await.map_err(to_mcp_error)?;
+        StandardResponse::new(
+            &vault_name,
+            "audit_stats",
+            serde_json::to_value(&result).map_err(|e| McpError::internal(e.to_string()))?,
+        )
+        .with_duration(start.elapsed().as_millis() as u64)
+        .with_next_steps(&["audit_log", "explain_vault"])
+        .to_json()
     }
 }
