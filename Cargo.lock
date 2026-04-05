@@ -4431,6 +4431,7 @@ dependencies = [
  "config",
  "criterion",
  "log",
+ "schemars",
  "serde",
  "serde_json",
  "serde_yaml",

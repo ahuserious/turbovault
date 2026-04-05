@@ -34,6 +34,59 @@ fn extract_count(value: &serde_json::Value) -> usize {
     }
 }
 
+#[derive(
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+    Debug,
+    Clone,
+)]
+#[serde(tag = "type")]
+pub enum BatchOperationInput {
+    #[serde(rename = "CreateNote", alias = "CreateFile")]
+    CreateNote { path: String, content: String },
+
+    #[serde(rename = "WriteNote", alias = "WriteFile")]
+    WriteNote { path: String, content: String },
+
+    #[serde(rename = "DeleteNote", alias = "DeleteFile")]
+    DeleteNote { path: String },
+
+    #[serde(rename = "MoveNote", alias = "MoveFile")]
+    MoveNote { from: String, to: String },
+
+    #[serde(rename = "UpdateLinks")]
+    UpdateLinks {
+        file: String,
+        old_target: String,
+        new_target: String,
+    },
+}
+
+impl From<BatchOperationInput> for BatchOperation {
+    fn from(operation: BatchOperationInput) -> Self {
+        match operation {
+            BatchOperationInput::CreateNote { path, content } => {
+                Self::CreateNote { path, content }
+            }
+            BatchOperationInput::WriteNote { path, content } => {
+                Self::WriteNote { path, content }
+            }
+            BatchOperationInput::DeleteNote { path } => Self::DeleteNote { path },
+            BatchOperationInput::MoveNote { from, to } => Self::MoveNote { from, to },
+            BatchOperationInput::UpdateLinks {
+                file,
+                old_target,
+                new_target,
+            } => Self::UpdateLinks {
+                file,
+                old_target,
+                new_target,
+            },
+        }
+    }
+}
+
 /// Standardized response envelope for all tools (LLMX improvement)
 /// Generic, non-cumbersome, forward-looking design
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -1550,33 +1603,20 @@ impl ObsidianMcpServer {
     )]
     async fn batch_execute(
         &self,
-        operations: Vec<serde_json::Value>,
+        operations: Vec<BatchOperationInput>,
     ) -> McpResult<serde_json::Value> {
         let (vault_name, manager) = self.get_vault_pair().await?;
 
-        // Parse operations from JSON
-        let mut ops = Vec::new();
-        for op_json in operations {
-            match serde_json::from_value::<BatchOperation>(op_json) {
-                Ok(op) => ops.push(op),
-                Err(e) => {
-                    return Err(McpError::internal(format!(
-                        "Invalid batch operation: {}",
-                        e
-                    )));
-                }
-            }
-        }
-
-        if ops.is_empty() {
+        if operations.is_empty() {
             return Err(McpError::internal(
                 "Batch operations list cannot be empty".to_string(),
             ));
         }
 
-        let op_count = ops.len();
+        let op_count = operations.len();
+        let operations = operations.into_iter().map(BatchOperation::from).collect();
         let tools = BatchTools::new(manager);
-        let result = tools.batch_execute(ops).await.map_err(to_mcp_error)?;
+        let result = tools.batch_execute(operations).await.map_err(to_mcp_error)?;
 
         self.invalidate_similarity_cache().await;
         self.invalidate_search_cache().await;
