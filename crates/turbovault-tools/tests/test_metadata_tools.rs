@@ -164,6 +164,35 @@ async fn test_query_metadata_equality() {
     let _response = result.unwrap();
 }
 
+/// Regression test for #12: query_metadata must return >0 matches on a vault
+/// with matching .md files. Prior to the fix, `Path::ends_with(".md")` used
+/// Rust's path-component matching (always false for extensions), causing
+/// query_metadata to silently skip every file and return 0 matches.
+#[tokio::test]
+async fn test_query_metadata_returns_matches_for_md_files() {
+    let (_temp_dir, manager) = setup_test_vault_with_metadata().await;
+    let tools = MetadataTools::new(manager);
+
+    // note1.md has status: "draft" — must appear in results
+    let result = tools.query_metadata(r#"status: "draft""#).await.unwrap();
+    let matched = result.get("matched").unwrap().as_u64().unwrap();
+    assert!(
+        matched > 0,
+        "query_metadata returned 0 matches — .md files may be skipped (see #12)"
+    );
+
+    let files = result.get("files").unwrap().as_array().unwrap();
+    let paths: Vec<&str> = files
+        .iter()
+        .filter_map(|f| f.get("path").and_then(|p| p.as_str()))
+        .collect();
+    assert!(
+        paths.iter().any(|p| p.contains("note1")),
+        "note1.md (status: draft) not found in results: {:?}",
+        paths
+    );
+}
+
 #[tokio::test]
 async fn test_query_metadata_comparison() {
     let (_temp_dir, manager) = setup_test_vault_with_metadata().await;
