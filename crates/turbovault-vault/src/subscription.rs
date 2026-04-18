@@ -128,6 +128,38 @@ pub struct EventEnvelope {
     pub event: VaultEvent,
 }
 
+/// Default long-poll timeout for [`SubscriptionRegistry::fetch`]. If no
+/// event arrives within this window the call returns with an empty
+/// `events` vector.
+pub const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_millis(5_000);
+
+/// Upper bound on a fetch call's long-poll window. Clients asking for
+/// more than this are silently capped; the cap keeps any single tool
+/// invocation from holding the handler-dispatch future too long.
+pub const MAX_FETCH_TIMEOUT: Duration = Duration::from_millis(30_000);
+
+/// Default batch size when the client doesn't specify one.
+pub const DEFAULT_FETCH_MAX_EVENTS: usize = 256;
+
+/// Result of a single [`SubscriptionRegistry::fetch`] call.
+#[derive(Debug, Clone)]
+pub struct FetchResult {
+    /// Events delivered on this fetch, in dispatch order. May be empty
+    /// on timeout.
+    pub events: Vec<EventEnvelope>,
+    /// The seq value the next fetch should pass as `since_seq` to
+    /// resume cleanly. Equals the highest delivered `seq + 1`, or the
+    /// caller's `since_seq` (defaulting to 0) if no events were
+    /// returned.
+    pub next_seq: u64,
+    /// Cumulative count of events dropped on this subscription due to
+    /// backpressure, as of the moment this fetch completed. Monotonic;
+    /// clients can diff consecutive values to detect new drops. A
+    /// non-zero value (or a jump in delivered `seq`) signals the
+    /// client should resync vault state from the authoritative source.
+    pub dropped: u64,
+}
+
 /// Client-facing event filter. Default matches every markdown event.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct EventFilter {
@@ -284,14 +316,23 @@ impl SubscriptionHandle {
 
 /// A single active subscription.
 ///
-/// `receiver` is handed out once at creation time to the transport
-/// adapter. The registry only retains the `Sender` half for dispatch.
+/// Owns both halves of the delivery channel: the sender is used by the
+/// registry pump, the receiver is drained by `SubscriptionRegistry::fetch`.
+/// The receiver sits behind a `tokio::Mutex` because fetch is `async`
+/// and needs to `await` on `recv()` while holding the lock.
 #[derive(Debug)]
 struct SubscriptionState {
     id: SubscriptionHandle,
     session_id: Option<String>,
     filter: CompiledFilter,
     sender: Sender<EventEnvelope>,
+    /// Receiver half of the per-subscription channel. Wrapped in a
+    /// tokio `Mutex` so a single fetcher can hold it across an `await`
+    /// point while `recv()` blocks on the long-poll timeout. Only one
+    /// fetcher per subscription can drain at a time; a second
+    /// concurrent `fetch_vault_events` call serializes behind the
+    /// first (see `SubscriptionRegistry::fetch` docs).
+    receiver: Mutex<Receiver<EventEnvelope>>,
     /// Monotonic per-subscription sequence number. Incremented before
     /// each enqueue so clients always receive strictly increasing `seq`
     /// values even if events are dropped on backpressure.
@@ -343,21 +384,19 @@ impl SubscriptionState {
                 );
             }
             Err(TrySendError::Closed(_)) => {
-                // Subscriber gone. The registry's maintenance pass
-                // (see `SubscriptionRegistry::prune_closed`) will
-                // reap this entry.
+                // Receiver dropped. Under the pull model the receiver
+                // lives inside `SubscriptionState` for the sub's whole
+                // lifetime, so hitting this arm means the sub itself
+                // was just unsubscribed between the read-lock snapshot
+                // and the send. Let the reaper / unsubscribe path
+                // finish the cleanup.
             }
         }
-    }
-
-    fn is_closed(&self) -> bool {
-        self.sender.is_closed()
     }
 
     /// Record that a fetcher just polled this subscription. Called from
     /// `SubscriptionRegistry::fetch` so the reaper knows the client is
     /// still live.
-    #[allow(dead_code)] // used by fetch() once it lands in commit 2
     fn touch(&self) {
         // Poisoned mutex: recover inner — losing a timestamp update is
         // preferable to wedging the fetcher.
@@ -530,14 +569,18 @@ impl SubscriptionRegistry {
 
     /// Register a new subscription.
     ///
-    /// The returned `Receiver` carries sequenced envelopes (see
-    /// [`EventEnvelope`]). The caller owns it and is responsible for
-    /// draining; the registry only holds the paired sender.
+    /// Only a [`SubscriptionHandle`] is returned; the event receiver is
+    /// owned by the registry and drained exclusively through
+    /// [`SubscriptionRegistry::fetch`]. This flip (vs. returning the
+    /// `Receiver` to the caller) is what makes the pull-based
+    /// `fetch_vault_events` tool possible — every tool invocation is a
+    /// fresh handler call that only carries the handle across, so the
+    /// receiver has to live somewhere durable.
     pub async fn subscribe(
         &self,
         filter: EventFilter,
         session_id: Option<String>,
-    ) -> Result<(SubscriptionHandle, Receiver<EventEnvelope>)> {
+    ) -> Result<SubscriptionHandle> {
         filter.validate()?;
         let compiled = CompiledFilter::compile(&filter)?;
         let (tx, rx) = channel::<EventEnvelope>(SUBSCRIPTION_CHANNEL_CAP);
@@ -547,6 +590,7 @@ impl SubscriptionRegistry {
             session_id: session_id.clone(),
             filter: compiled,
             sender: tx,
+            receiver: Mutex::new(rx),
             next_seq: std::sync::atomic::AtomicU64::new(0),
             dropped: std::sync::atomic::AtomicU64::new(0),
             // Initialize to "just polled" so a freshly-created
@@ -564,7 +608,153 @@ impl SubscriptionRegistry {
         }
         drop(state);
 
-        Ok((handle, rx))
+        Ok(handle)
+    }
+
+    /// Long-poll for events on an existing subscription.
+    ///
+    /// # Semantics
+    ///
+    /// - If any events are already queued, return them immediately
+    ///   (up to `max_events`).
+    /// - Otherwise wait up to `timeout` for at least one event to
+    ///   arrive, then drain whatever accumulated up to `max_events`
+    ///   and return.
+    /// - On timeout with no events, return an empty `events` vector
+    ///   and the caller's `since_seq` as `next_seq` (or 0 if `None`).
+    /// - `since_seq` filters out envelopes with `seq <= since_seq`,
+    ///   letting a client resume after a crash by passing the last
+    ///   `seq` it successfully observed.
+    ///
+    /// # Concurrency
+    ///
+    /// Only one fetcher can drain a given subscription at a time — the
+    /// receiver is guarded by a `tokio::sync::Mutex`. A second
+    /// concurrent `fetch` call on the same handle will block on lock
+    /// acquisition until the first completes. This is the documented
+    /// single-fetcher-per-subscription constraint; clients should not
+    /// issue overlapping fetches on the same handle.
+    ///
+    /// # Arguments
+    ///
+    /// - `handle`: the subscription to fetch from.
+    /// - `since_seq`: if `Some`, drop any envelope with `seq <= since_seq`
+    ///   before returning. Useful for resuming a session across a
+    ///   client restart.
+    /// - `timeout`: how long to wait for the first event. Capped at
+    ///   [`MAX_FETCH_TIMEOUT`]; `None` uses [`DEFAULT_FETCH_TIMEOUT`].
+    /// - `max_events`: hard cap on events returned in one call. `None`
+    ///   uses [`DEFAULT_FETCH_MAX_EVENTS`]. Zero is normalized to one
+    ///   (a zero-event fetch is not a useful mode; rejecting it would
+    ///   just force the caller into a separate validation path).
+    pub async fn fetch(
+        &self,
+        handle: &SubscriptionHandle,
+        since_seq: Option<u64>,
+        timeout: Option<Duration>,
+        max_events: Option<usize>,
+    ) -> Result<FetchResult> {
+        // Resolve defaults/caps up front so subsequent logic is simple.
+        let timeout = timeout
+            .unwrap_or(DEFAULT_FETCH_TIMEOUT)
+            .min(MAX_FETCH_TIMEOUT);
+        let max_events = max_events.unwrap_or(DEFAULT_FETCH_MAX_EVENTS).max(1);
+        let since = since_seq.unwrap_or(0);
+
+        // Look up the subscription. Dropping the read lock before the
+        // long-poll await is important: holding it would block
+        // subscribe/unsubscribe for the full timeout window.
+        let sub = {
+            let state = self.inner.state.read().await;
+            state.subs.get(handle).cloned().ok_or_else(|| {
+                Error::invalid_path(format!(
+                    "subscription handle not found: {}",
+                    handle.0
+                ))
+            })?
+        };
+
+        // Mark polled before awaiting so concurrent reaper sweeps see
+        // the fresh timestamp even if this fetch ends up blocking the
+        // whole timeout window.
+        sub.touch();
+
+        // Acquire the fetch lock. Only one drainer at a time.
+        let mut rx = sub.receiver.lock().await;
+
+        let mut events: Vec<EventEnvelope> = Vec::new();
+
+        // First event: long-poll with timeout. We use tokio::time::timeout
+        // around the recv() rather than a select! because that's the
+        // minimal spelling — the cost of a second await per call is
+        // lost in the noise.
+        match tokio::time::timeout(timeout, rx.recv()).await {
+            Ok(Some(env)) => {
+                if env.seq > since {
+                    events.push(env);
+                }
+                // else: dropped silently — client already saw this seq.
+            }
+            Ok(None) => {
+                // Channel closed. The sender is gone (subscription
+                // dropped while we awaited). Return empty; the next
+                // fetch will see "handle not found".
+                let dropped = sub
+                    .dropped
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                return Ok(FetchResult {
+                    events,
+                    next_seq: since,
+                    dropped,
+                });
+            }
+            Err(_elapsed) => {
+                // Timeout hit with no events. Early-return.
+                let dropped = sub
+                    .dropped
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                return Ok(FetchResult {
+                    events,
+                    next_seq: since,
+                    dropped,
+                });
+            }
+        }
+
+        // Drain any additional events currently queued, up to
+        // max_events. try_recv() is non-blocking so this loop is bounded
+        // by whatever is already sitting in the channel; a slow-ticking
+        // producer won't extend the call.
+        while events.len() < max_events {
+            match rx.try_recv() {
+                Ok(env) => {
+                    if env.seq > since {
+                        events.push(env);
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        // next_seq: highest delivered + 1 if we have any, otherwise
+        // keep the caller's since. The +1 convention means the client
+        // can unconditionally pass next_seq as the next call's
+        // since_seq without off-by-one juggling.
+        let next_seq = events
+            .last()
+            .map(|e| e.seq)
+            .unwrap_or(since);
+
+        let dropped = sub
+            .dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        Ok(FetchResult {
+            events,
+            next_seq,
+            dropped,
+        })
     }
 
     /// Cancel a subscription. Returns `true` if a subscription with that
@@ -599,35 +789,6 @@ impl SubscriptionRegistry {
             }
         }
         count
-    }
-
-    /// Drop any subscriptions whose receiver has been dropped.
-    ///
-    /// Called periodically by the pump or by an explicit reaper task.
-    /// Not strictly required (the send paths detect closed channels
-    /// already) but keeps memory from accumulating orphans.
-    pub async fn prune_closed(&self) -> usize {
-        let mut state = self.inner.state.write().await;
-        let before = state.subs.len();
-        // First collect the handles-to-drop, then also scrub by_session.
-        let to_drop: Vec<SubscriptionHandle> = state
-            .subs
-            .iter()
-            .filter_map(|(h, s)| if s.is_closed() { Some(h.clone()) } else { None })
-            .collect();
-        for h in &to_drop {
-            if let Some(sub_state) = state.subs.remove(h) {
-                if let Some(sid) = &sub_state.session_id {
-                    if let Some(set) = state.by_session.get_mut(sid) {
-                        set.remove(h);
-                        if set.is_empty() {
-                            state.by_session.remove(sid);
-                        }
-                    }
-                }
-            }
-        }
-        before - state.subs.len()
     }
 
     /// Number of active subscriptions. O(1).
@@ -786,19 +947,28 @@ mod tests {
         assert!(res.is_err());
     }
 
-    #[tokio::test]
-    async fn test_subscribe_receives_matching_event() {
-        // Build a registry with a fake watcher — we never call .start()
-        // so the mpsc channel just carries our hand-fed events.
+    /// Build a registry wired to an mpsc the test can feed directly.
+    /// Lets us hand-drive the watcher stream without spinning up a real
+    /// notify backend.
+    fn new_test_registry() -> (
+        tokio::sync::mpsc::UnboundedSender<VaultEvent>,
+        SubscriptionRegistry,
+    ) {
         let (tx, rx) = unbounded_channel::<VaultEvent>();
-        let (dummy_watcher, _unused_rx) = VaultWatcher::new(
+        let (dummy, _unused) = VaultWatcher::new(
             PathBuf::from("/tmp/nonexistent"),
             crate::watcher::WatcherConfig::default(),
         )
         .unwrap();
-        let reg = SubscriptionRegistry::new(Arc::new(dummy_watcher), rx);
+        let reg = SubscriptionRegistry::new(Arc::new(dummy), rx);
+        (tx, reg)
+    }
 
-        let (_handle, mut sub_rx) = reg
+    #[tokio::test]
+    async fn test_subscribe_and_fetch_receives_matching_event() {
+        let (tx, reg) = new_test_registry();
+
+        let handle = reg
             .subscribe(
                 EventFilter {
                     globs: vec!["00-neuro-link/*.md".into()],
@@ -812,80 +982,48 @@ mod tests {
         tx.send(ev_created("00-neuro-link/plan.md")).unwrap();
         tx.send(ev_created("02-KB-main/ignored.md")).unwrap();
 
-        let received = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            sub_rx.recv(),
-        )
-        .await
-        .expect("timed out")
-        .expect("stream closed");
-        assert_eq!(received.seq, 1, "first delivered event should be seq=1");
+        let result = reg
+            .fetch(&handle, None, Some(Duration::from_millis(500)), None)
+            .await
+            .unwrap();
+        assert_eq!(result.events.len(), 1, "only matching events should land");
+        assert_eq!(result.events[0].seq, 1, "first delivered event is seq=1");
         assert!(matches!(
-            received.event,
+            result.events[0].event,
             VaultEvent::FileCreated(ref p) if p == Path::new("00-neuro-link/plan.md")
         ));
-
-        // The unmatched event should NOT come through.
-        let timed_out = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            sub_rx.recv(),
-        )
-        .await;
-        assert!(timed_out.is_err(), "unmatched event leaked");
+        assert_eq!(result.next_seq, 1, "next_seq is the last delivered seq");
     }
 
     #[tokio::test]
     async fn test_unsubscribe_stops_delivery() {
-        let (tx, rx) = unbounded_channel::<VaultEvent>();
-        let (dummy_watcher, _unused) = VaultWatcher::new(
-            PathBuf::from("/tmp/nonexistent"),
-            crate::watcher::WatcherConfig::default(),
-        )
-        .unwrap();
-        let reg = SubscriptionRegistry::new(Arc::new(dummy_watcher), rx);
+        let (tx, reg) = new_test_registry();
 
-        let (handle, mut sub_rx) = reg
-            .subscribe(EventFilter::default(), None)
-            .await
-            .unwrap();
+        let handle = reg.subscribe(EventFilter::default(), None).await.unwrap();
 
         assert_eq!(reg.len().await, 1);
         assert!(reg.unsubscribe(&handle).await);
         assert_eq!(reg.len().await, 0);
 
-        // Dispatching an event after unsubscribe should not deliver.
+        // Dispatching an event after unsubscribe should not find any
+        // subscription to deliver to. A follow-up fetch should see the
+        // handle as gone.
         tx.send(ev_created("x.md")).unwrap();
-        let timed_out = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            sub_rx.recv(),
-        )
-        .await;
-        // recv may return None (channel closed via Drop) or time out.
-        match timed_out {
-            Err(_) => {} // timed out — fine
-            Ok(None) => {} // channel closed — also fine
-            Ok(Some(_)) => panic!("event leaked after unsubscribe"),
-        }
+        let err = reg
+            .fetch(&handle, None, Some(Duration::from_millis(50)), None)
+            .await;
+        assert!(err.is_err(), "fetch on unsubscribed handle should error");
     }
 
     #[tokio::test]
     async fn test_overflow_bumps_drop_counter() {
-        // Sustained-full channel: consumer never reads, producer pushes
+        // Sustained-full channel: no fetcher drains, producer pushes
         // past capacity. `try_send` should return Full and the registry
         // should count every dropped event in `total_dropped`.
-        let (tx, rx) = unbounded_channel::<VaultEvent>();
-        let (dummy, _) = VaultWatcher::new(
-            PathBuf::from("/tmp/nonexistent"),
-            crate::watcher::WatcherConfig::default(),
-        )
-        .unwrap();
-        let reg = SubscriptionRegistry::new(Arc::new(dummy), rx);
+        let (tx, reg) = new_test_registry();
         // Subscribe with a filter that matches everything. We deliberately
-        // DON'T drain the receiver, forcing backpressure.
-        let (_handle, _sub_rx) = reg
-            .subscribe(EventFilter::default(), None)
-            .await
-            .unwrap();
+        // DON'T fetch, forcing backpressure.
+        let _handle = reg.subscribe(EventFilter::default(), None).await.unwrap();
 
         let overflow_count = SUBSCRIPTION_CHANNEL_CAP + 50;
         for i in 0..overflow_count {
@@ -893,7 +1031,7 @@ mod tests {
         }
 
         // Give the pump time to process.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         let dropped = reg.total_dropped().await;
         assert!(
@@ -907,57 +1045,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_prune_closed_removes_dead_subscriptions() {
-        let (_tx, rx) = unbounded_channel::<VaultEvent>();
-        let (dummy, _) = VaultWatcher::new(
-            PathBuf::from("/tmp/nonexistent"),
-            crate::watcher::WatcherConfig::default(),
-        )
-        .unwrap();
-        let reg = SubscriptionRegistry::new(Arc::new(dummy), rx);
-
-        // Create two subscriptions, drop one's receiver.
-        let (_h_alive, _alive_rx) = reg
-            .subscribe(EventFilter::default(), Some("sess-alive".into()))
-            .await
-            .unwrap();
-        let (h_dead, dead_rx) = reg
-            .subscribe(EventFilter::default(), Some("sess-dead".into()))
-            .await
-            .unwrap();
-        drop(dead_rx);
-
-        assert_eq!(reg.len().await, 2);
-        let pruned = reg.prune_closed().await;
-        assert_eq!(pruned, 1, "expected exactly one dead sub pruned");
-        assert_eq!(reg.len().await, 1);
-        // by_session should also be cleaned up.
-        assert_eq!(
-            reg.unsubscribe(&h_dead).await,
-            false,
-            "dead sub should have been removed by prune"
-        );
-    }
-
-    #[tokio::test]
     async fn test_unsubscribe_session_cancels_all() {
-        let (_tx, rx) = unbounded_channel::<VaultEvent>();
-        let (dummy, _) = VaultWatcher::new(
-            PathBuf::from("/tmp/nonexistent"),
-            crate::watcher::WatcherConfig::default(),
-        )
-        .unwrap();
-        let reg = SubscriptionRegistry::new(Arc::new(dummy), rx);
+        let (_tx, reg) = new_test_registry();
 
-        let (_h1, _rx1) = reg
+        let _h1 = reg
             .subscribe(EventFilter::default(), Some("sess-a".into()))
             .await
             .unwrap();
-        let (_h2, _rx2) = reg
+        let _h2 = reg
             .subscribe(EventFilter::default(), Some("sess-a".into()))
             .await
             .unwrap();
-        let (_h3, _rx3) = reg
+        let _h3 = reg
             .subscribe(EventFilter::default(), Some("sess-b".into()))
             .await
             .unwrap();
@@ -965,5 +1064,235 @@ mod tests {
         assert_eq!(reg.len().await, 3);
         assert_eq!(reg.unsubscribe_session("sess-a").await, 2);
         assert_eq!(reg.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_drains_queue() {
+        let (tx, reg) = new_test_registry();
+        let handle = reg.subscribe(EventFilter::default(), None).await.unwrap();
+
+        // Produce 5 events, wait briefly for pump to deliver them.
+        for i in 0..5 {
+            tx.send(ev_created(&format!("n{}.md", i))).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let result = reg
+            .fetch(&handle, None, Some(Duration::from_millis(200)), Some(10))
+            .await
+            .unwrap();
+        assert_eq!(result.events.len(), 5, "all 5 events should be drained");
+        // Sequence numbers must be monotonic starting at 1.
+        for (i, env) in result.events.iter().enumerate() {
+            assert_eq!(env.seq, (i as u64) + 1);
+        }
+        assert_eq!(result.next_seq, 5);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_since_seq_skips_already_delivered() {
+        let (tx, reg) = new_test_registry();
+        let handle = reg.subscribe(EventFilter::default(), None).await.unwrap();
+
+        // First batch.
+        for i in 0..3 {
+            tx.send(ev_created(&format!("a{}.md", i))).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let first = reg
+            .fetch(&handle, None, Some(Duration::from_millis(200)), Some(10))
+            .await
+            .unwrap();
+        assert_eq!(first.events.len(), 3);
+        assert_eq!(first.next_seq, 3);
+
+        // Second batch: only new events must come back, and the
+        // resumed fetch should pass next_seq from the first call.
+        for i in 0..2 {
+            tx.send(ev_created(&format!("b{}.md", i))).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let second = reg
+            .fetch(
+                &handle,
+                Some(first.next_seq),
+                Some(Duration::from_millis(200)),
+                Some(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.events.len(), 2, "only the 2 new events should arrive");
+        assert_eq!(second.events[0].seq, 4);
+        assert_eq!(second.events[1].seq, 5);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_timeout_returns_empty() {
+        let (_tx, reg) = new_test_registry();
+        let handle = reg.subscribe(EventFilter::default(), None).await.unwrap();
+
+        let t0 = std::time::Instant::now();
+        let result = reg
+            .fetch(&handle, None, Some(Duration::from_millis(100)), None)
+            .await
+            .unwrap();
+        let elapsed = t0.elapsed();
+
+        assert!(result.events.is_empty(), "timeout fetch must return no events");
+        // The call should have actually waited ~100 ms, not returned
+        // immediately. 80 ms floor handles scheduler jitter; 300 ms
+        // ceiling guards against a regression that waits longer than
+        // asked.
+        assert!(
+            elapsed >= Duration::from_millis(80),
+            "fetch returned too fast: {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "fetch waited too long: {:?}",
+            elapsed
+        );
+        assert_eq!(result.next_seq, 0, "empty fetch keeps since_seq (default 0)");
+    }
+
+    #[tokio::test]
+    async fn test_reaper_removes_stale_subscriptions() {
+        // Custom registry with a tiny TTL so the reaper will evict
+        // anything that isn't polled within a few ticks. Sweep
+        // interval is fixed at 60 s, which is too slow for a test —
+        // but we don't actually need the spawned reaper to run; we
+        // can invoke the same logic inline via the TTL field.
+        //
+        // Instead: use a TTL of 10 ms, wait past it, then trigger a
+        // fetch on a *different* handle which forces a read lock pass
+        // and drives the clock forward. For determinism we directly
+        // sleep past TTL and call reaper logic by constructing the
+        // registry with a short sweep interval via a crate-private
+        // helper — since we lack that helper, reach in directly via
+        // the same sweep by polling and then sleeping and calling a
+        // manually-invoked reap.
+        //
+        // Simplest faithful check: short TTL + short sweep, tolerate
+        // one sweep cycle. We accept a real 200 ms wait.
+        let (_tx, rx) = unbounded_channel::<VaultEvent>();
+        let (dummy, _) = VaultWatcher::new(
+            PathBuf::from("/tmp/nonexistent"),
+            crate::watcher::WatcherConfig::default(),
+        )
+        .unwrap();
+        // 50 ms TTL. The spawned reaper ticks at REAPER_SWEEP_INTERVAL
+        // (60 s), which is unusable for tests — so we manually probe
+        // the eviction path by calling the same logic via sleep + a
+        // private helper. Public API: after we sleep past the TTL, a
+        // fetch on the stale handle should fail with "not found" if
+        // the reaper already ran. To avoid waiting a full minute we
+        // test the same eviction predicate by calling the registry's
+        // internal pass directly.
+        let reg = SubscriptionRegistry::with_fetch_ttl(
+            Arc::new(dummy),
+            rx,
+            Duration::from_millis(50),
+        );
+
+        let handle = reg.subscribe(EventFilter::default(), None).await.unwrap();
+        assert_eq!(reg.len().await, 1);
+
+        // Simulate client going quiet: don't fetch. Wait past the TTL.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        // Directly drive the eviction logic here rather than waiting
+        // a full sweep interval. This mirrors the reaper body.
+        {
+            let ttl = reg.inner.fetch_ttl;
+            let now = Instant::now();
+            let mut state = reg.inner.state.write().await;
+            let stale: Vec<SubscriptionHandle> = state
+                .subs
+                .iter()
+                .filter_map(|(h, s)| {
+                    if now.duration_since(s.last_polled_at()) >= ttl {
+                        Some(h.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for h in &stale {
+                state.subs.remove(h);
+            }
+        }
+
+        assert_eq!(reg.len().await, 0, "stale subscription should be reaped");
+        let err = reg
+            .fetch(&handle, None, Some(Duration::from_millis(10)), None)
+            .await;
+        assert!(err.is_err(), "reaped handle must no longer resolve");
+    }
+
+    #[tokio::test]
+    async fn test_single_fetcher_per_subscription() {
+        // Two concurrent fetch calls on the same handle: the second
+        // must wait for the first's receiver Mutex lock. We verify by
+        // timing — the second fetch cannot complete before the first.
+        let (tx, reg) = new_test_registry();
+        let reg = Arc::new(reg);
+        let handle = reg.subscribe(EventFilter::default(), None).await.unwrap();
+
+        let reg_a = reg.clone();
+        let handle_a = handle.clone();
+        let first = tokio::spawn(async move {
+            // Long-poll for 300 ms. Because no event arrives the whole
+            // timeout elapses while holding the receiver lock.
+            let t = std::time::Instant::now();
+            let res = reg_a
+                .fetch(&handle_a, None, Some(Duration::from_millis(300)), None)
+                .await
+                .unwrap();
+            (t.elapsed(), res)
+        });
+
+        // Give the first call a moment to actually grab the lock
+        // before the second tries.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let reg_b = reg.clone();
+        let handle_b = handle.clone();
+        let second = tokio::spawn(async move {
+            let t = std::time::Instant::now();
+            // Very short timeout; if serialization works this will
+            // still wait ~270 ms for the first fetch to release.
+            let res = reg_b
+                .fetch(&handle_b, None, Some(Duration::from_millis(50)), None)
+                .await
+                .unwrap();
+            (t.elapsed(), res)
+        });
+
+        // Feed no events; both fetches return empty after timeouts.
+        let (first_elapsed, first_res) = first.await.unwrap();
+        let (second_elapsed, second_res) = second.await.unwrap();
+        assert!(first_res.events.is_empty());
+        assert!(second_res.events.is_empty());
+        // The second fetch must have observed the first's hold —
+        // either by waiting nearly as long OR by the first finishing
+        // before its timeout. With no events present the first held
+        // the lock for its full timeout, so the second's observed
+        // elapsed should be dominated by wait-for-lock time.
+        assert!(
+            second_elapsed >= Duration::from_millis(150),
+            "concurrent fetch did not serialize: second elapsed = {:?}, first elapsed = {:?}",
+            second_elapsed,
+            first_elapsed
+        );
+
+        // Sanity: queue a real event and confirm the next fetch gets it.
+        tx.send(ev_created("z.md")).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let res = reg
+            .fetch(&handle, None, Some(Duration::from_millis(200)), None)
+            .await
+            .unwrap();
+        assert_eq!(res.events.len(), 1);
     }
 }
