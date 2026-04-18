@@ -104,8 +104,10 @@ pub use atomic::{AtomicFileOps, FileOp, TransactionResult};
 pub use edit::{EditEngine, EditResult, SearchReplaceBlock, compute_hash};
 pub use manager::VaultManager;
 pub use subscription::{
-    EventFilter, SubscriptionHandle, SubscriptionRegistry, VaultEventKind,
-    MAX_GLOB_PATTERNS, MAX_GLOB_TOTAL_BYTES, SUBSCRIPTION_CHANNEL_CAP,
+    EventEnvelope, EventFilter, FetchResult, SubscriptionHandle, SubscriptionRegistry,
+    VaultEventKind, DEFAULT_FETCH_MAX_EVENTS, DEFAULT_FETCH_TIMEOUT,
+    DEFAULT_SUBSCRIPTION_FETCH_TTL, MAX_FETCH_TIMEOUT, MAX_GLOB_PATTERNS,
+    MAX_GLOB_TOTAL_BYTES, REAPER_SWEEP_INTERVAL, SUBSCRIPTION_CHANNEL_CAP,
 };
 pub use turbovault_core::prelude::*;
 pub use watcher::{VaultEvent, VaultWatcher, WatcherConfig};
