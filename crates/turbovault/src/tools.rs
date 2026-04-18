@@ -4,7 +4,8 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::Duration;
+use tokio::sync::{OnceCell, RwLock};
 use turbomcp::prelude::*;
 use turbovault_audit::{AuditFilter, AuditLog, OperationType, SnapshotStore};
 use turbovault_core::ServerConfig;
@@ -16,7 +17,10 @@ use turbovault_tools::{
     SearchQuery, SearchTools, SimilarityEngine, TemplateEngine, VaultLifecycleTools, WriteMode,
     obsidian_uri,
 };
-use turbovault_vault::VaultManager;
+use turbovault_vault::{
+    EventEnvelope, EventFilter, SubscriptionHandle, SubscriptionRegistry, VaultEvent,
+    VaultEventKind, VaultManager, VaultWatcher, WatcherConfig,
+};
 
 #[cfg(feature = "sql")]
 use turbovault_tools::FrontmatterSqlEngine;
@@ -28,6 +32,130 @@ pub struct FrontmatterFilter {
     pub key: String,
     /// Value to match against (substring match)
     pub value: String,
+}
+
+/// JSON-serializable mirror of [`EventFilter`] for the MCP tool layer.
+///
+/// We can't reuse `EventFilter` directly because `VaultEventKind`'s
+/// existing `serde` attributes don't map cleanly to `JsonSchema`
+/// without adding a `schemars` dep on `turbovault-vault`, so we keep a
+/// thin DTO here and convert at the tool boundary.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct EventFilterDto {
+    /// Gitignore-style glob patterns. Empty means "all paths match".
+    /// Negation patterns (starting with `!`) exclude matches.
+    #[serde(default)]
+    pub globs: Vec<String>,
+    /// If present, only events whose kind is listed are delivered.
+    /// Valid values: "created", "modified", "deleted", "renamed".
+    #[serde(default)]
+    pub kinds: Option<Vec<String>>,
+}
+
+impl EventFilterDto {
+    /// Convert into the library-layer `EventFilter`, mapping kind
+    /// strings to `VaultEventKind`. Unknown kinds are surfaced as an
+    /// invalid-request error rather than silently dropped so clients
+    /// catch typos immediately.
+    fn into_filter(self) -> McpResult<EventFilter> {
+        let kinds = self
+            .kinds
+            .map(|v| {
+                v.into_iter()
+                    .map(|s| match s.as_str() {
+                        "created" => Ok(VaultEventKind::Created),
+                        "modified" => Ok(VaultEventKind::Modified),
+                        "deleted" => Ok(VaultEventKind::Deleted),
+                        "renamed" => Ok(VaultEventKind::Renamed),
+                        other => Err(McpError::invalid_request(format!(
+                            "unknown event kind {:?}; expected one of created|modified|deleted|renamed",
+                            other
+                        ))),
+                    })
+                    .collect::<McpResult<Vec<_>>>()
+            })
+            .transpose()?;
+        Ok(EventFilter {
+            globs: self.globs,
+            kinds,
+        })
+    }
+}
+
+/// Response shape for `subscribe_vault_events`.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+pub struct SubscribeResult {
+    /// Opaque UUIDv4 handle. Pass to `fetch_vault_events` /
+    /// `unsubscribe_vault_events`.
+    pub handle: String,
+    /// RFC-3339 UTC timestamp when the subscription was registered.
+    pub created_at: String,
+}
+
+/// Wire-format envelope for a delivered vault event.
+///
+/// JSON shape intentionally flat — keeps MCP client code trivial.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+pub struct EventEnvelopeDto {
+    /// Monotonically-increasing sequence number (per-subscription).
+    pub seq: u64,
+    /// One of: "created" | "modified" | "deleted" | "renamed".
+    pub kind: &'static str,
+    /// For renamed events this is the destination path; for all
+    /// others this is the affected path. Paths are reported in the
+    /// OS-native encoding the vault uses.
+    pub path: String,
+    /// Source path for "renamed" events; `None` for all other kinds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+}
+
+impl From<EventEnvelope> for EventEnvelopeDto {
+    fn from(env: EventEnvelope) -> Self {
+        let (kind, path, from) = match env.event {
+            VaultEvent::FileCreated(p) => ("created", path_to_string(&p), None),
+            VaultEvent::FileModified(p) => ("modified", path_to_string(&p), None),
+            VaultEvent::FileDeleted(p) => ("deleted", path_to_string(&p), None),
+            VaultEvent::FileRenamed(from, to) => {
+                ("renamed", path_to_string(&to), Some(path_to_string(&from)))
+            }
+        };
+        Self {
+            seq: env.seq,
+            kind,
+            path,
+            from,
+        }
+    }
+}
+
+fn path_to_string(p: &std::path::Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+/// Response shape for `fetch_vault_events`.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+pub struct FetchResultDto {
+    /// Events delivered on this call, in dispatch order. May be empty
+    /// on timeout.
+    pub events: Vec<EventEnvelopeDto>,
+    /// Pass this back as the next call's `since_seq` for seamless
+    /// resume across restarts.
+    pub next_seq: u64,
+    /// Cumulative count of events dropped on this subscription (due
+    /// to backpressure). Non-zero means the client should treat the
+    /// current view as stale and re-read from the authoritative
+    /// source.
+    pub dropped: u64,
+}
+
+/// Response shape for `unsubscribe_vault_events`.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+pub struct UnsubResult {
+    /// `true` if a subscription with that handle was found and
+    /// removed; `false` if the handle was unknown (already removed,
+    /// never existed, or reaped for inactivity).
+    pub removed: bool,
 }
 
 /// Helper to convert internal Error to McpError
@@ -177,6 +305,15 @@ pub struct ObsidianMcpServer {
     similarity_engines: Arc<RwLock<HashMap<String, Arc<SimilarityEngine>>>>,
     /// Search engines per vault (keyed by vault name, lazy-initialized)
     search_engines: Arc<RwLock<HashMap<String, Arc<SearchEngine>>>>,
+    /// Subscription registry for pull-based vault-event streaming. Built
+    /// lazily on the first `subscribe_vault_events` call because the
+    /// server is vault-agnostic at startup — there's no path to watch
+    /// until a vault is registered. `OnceCell::get_or_try_init` ensures
+    /// a single construction even under concurrent subscribers. The
+    /// registry is pinned to the active vault at first-subscribe time
+    /// for the server's lifetime; switching to a different vault later
+    /// continues using the original watcher (documented limitation).
+    subscription_registry: Arc<OnceCell<Arc<SubscriptionRegistry>>>,
 }
 
 impl ObsidianMcpServer {
@@ -195,6 +332,7 @@ impl ObsidianMcpServer {
             snapshot_stores: Arc::new(RwLock::new(HashMap::new())),
             similarity_engines: Arc::new(RwLock::new(HashMap::new())),
             search_engines: Arc::new(RwLock::new(HashMap::new())),
+            subscription_registry: Arc::new(OnceCell::new()),
         })
     }
 
@@ -209,6 +347,57 @@ impl ObsidianMcpServer {
     /// Get the multi-vault manager
     pub fn multi_vault(&self) -> Arc<MultiVaultManager> {
         self.multi_vault_mgr.clone()
+    }
+
+    /// Obtain the subscription registry, building it on first call.
+    ///
+    /// Uses the currently-active vault's path to construct a
+    /// `VaultWatcher` rooted at that directory, then wraps it in a
+    /// `SubscriptionRegistry`. Subsequent callers re-use the same
+    /// registry via `OnceCell::get_or_try_init` — no redundant
+    /// watchers, no race on construction.
+    ///
+    /// Returns an error if no vault is active or the watcher fails to
+    /// start (e.g. path doesn't exist).
+    async fn get_or_init_subscription_registry(
+        &self,
+    ) -> McpResult<Arc<SubscriptionRegistry>> {
+        self.subscription_registry
+            .get_or_try_init(|| async {
+                // Resolve active vault's path. We don't hold any
+                // VaultManager reference — the watcher just needs the
+                // directory, independent of the vault's index state.
+                let vault_config = self
+                    .multi_vault_mgr
+                    .get_active_vault_config()
+                    .await
+                    .map_err(|e| {
+                        McpError::internal(format!(
+                            "cannot subscribe to vault events without an active vault: {}",
+                            e
+                        ))
+                    })?;
+
+                // Build & start a watcher. We keep the same debounce /
+                // markdown-only defaults the rest of the server uses
+                // so subscription events are consistent with what
+                // other tools observe.
+                let (mut watcher, event_rx) = VaultWatcher::new(
+                    vault_config.path.clone(),
+                    WatcherConfig::default(),
+                )
+                .map_err(|e| {
+                    McpError::internal(format!("failed to create vault watcher: {}", e))
+                })?;
+                watcher.start().await.map_err(|e| {
+                    McpError::internal(format!("failed to start vault watcher: {}", e))
+                })?;
+
+                let registry = SubscriptionRegistry::new(Arc::new(watcher), event_rx);
+                Ok::<_, McpError>(Arc::new(registry))
+            })
+            .await
+            .cloned()
     }
 
     /// Helper to save vault state to cache
@@ -2700,4 +2889,193 @@ impl ObsidianMcpServer {
         .with_next_steps(&["audit_log", "explain_vault"])
         .to_json()
     }
+
+    // ==================== Pull-based vault event stream ====================
+
+    /// Register a subscription for vault file-system events.
+    ///
+    /// Pairs with `fetch_vault_events` + `unsubscribe_vault_events` to
+    /// implement a pull-delivery event stream (rationale: TurboMCP 3.0.11
+    /// cannot emit custom server-to-client notifications from `#[tool]`
+    /// handlers; see PR #2 spike findings).
+    #[tool(
+        description = "Register to receive vault file-system events (created/modified/deleted/renamed). Returns an opaque handle; use fetch_vault_events to poll for events and unsubscribe_vault_events when done",
+        usage = "Pass a filter to restrict events by path glob or event kind. Pull-based: events accumulate in a per-subscription 256-slot buffer; drain via fetch_vault_events on any cadence. If the client stalls for 15 minutes without polling, the server reaps the subscription automatically. Glob syntax is gitignore-like: `**` crosses path segments, `!pattern` excludes",
+        performance = "Fast (<5ms typical). Spins up a file watcher lazily on the first subscribe",
+        related = ["fetch_vault_events", "unsubscribe_vault_events"],
+        examples = [
+            "subscribe_vault_events()",
+            "subscribe_vault_events(filter: { globs: [\"**/*.md\"] })",
+            "subscribe_vault_events(filter: { globs: [\"02-KB-main/**/*.md\", \"!**/trash/**\"], kinds: [\"created\", \"modified\"] })"
+        ]
+    )]
+    async fn subscribe_vault_events(
+        &self,
+        filter: Option<EventFilterDto>,
+    ) -> McpResult<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let vault_name = self.get_active_vault_name().await?;
+
+        // Convert and validate the filter BEFORE building the registry
+        // so the caller gets fast feedback on bad globs.
+        let event_filter = filter
+            .unwrap_or_default()
+            .into_filter()?;
+
+        let registry = self.get_or_init_subscription_registry().await?;
+        let handle = registry
+            .subscribe(event_filter, None)
+            .await
+            .map_err(to_mcp_error)?;
+
+        // RFC-3339 UTC for created_at. chrono isn't in our deps; build
+        // it from SystemTime + manual formatting to avoid a new crate.
+        // Using the secs-since-epoch field plus a simple formatter
+        // would be error-prone, so we fall back to a minimal %Y-%m-%dT%H:%M:%SZ
+        // approximation built on std alone.
+        let created_at = format_iso8601_now();
+
+        let result = SubscribeResult {
+            handle: handle.0,
+            created_at,
+        };
+
+        StandardResponse::new(
+            &vault_name,
+            "subscribe_vault_events",
+            serde_json::to_value(&result)
+                .map_err(|e| McpError::internal(e.to_string()))?,
+        )
+        .with_duration(start.elapsed().as_millis() as u64)
+        .with_next_steps(&["fetch_vault_events", "unsubscribe_vault_events"])
+        .to_json()
+    }
+
+    /// Long-poll for accumulated vault events on an existing subscription.
+    #[tool(
+        description = "Pull events from a subscription (returned by subscribe_vault_events). Long-polls up to timeout_ms (default 5000, max 30000) for the first event, then drains whatever else is queued up to max_events",
+        usage = "Resume across restarts by passing since_seq equal to the previous response's next_seq — only newer events come back. A single subscription allows one fetcher at a time; concurrent fetch calls serialize behind the first. If `dropped` is non-zero, buffer overflowed and the client should treat its vault view as stale",
+        performance = "Blocks up to timeout_ms; returns immediately once events arrive",
+        related = ["subscribe_vault_events", "unsubscribe_vault_events"],
+        examples = [
+            "fetch_vault_events(handle: \"<uuid>\")",
+            "fetch_vault_events(handle: \"<uuid>\", since_seq: 42, timeout_ms: 10000, max_events: 100)"
+        ]
+    )]
+    async fn fetch_vault_events(
+        &self,
+        handle: String,
+        since_seq: Option<u64>,
+        timeout_ms: Option<u64>,
+        max_events: Option<usize>,
+    ) -> McpResult<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let vault_name = self.get_active_vault_name().await?;
+
+        // If no registry has been built yet, there are also no
+        // subscriptions. Reject before we touch anything else — avoids
+        // unnecessarily bootstrapping a watcher just to say "unknown
+        // handle".
+        let registry = self.subscription_registry.get().ok_or_else(|| {
+            McpError::invalid_request(
+                "no active subscriptions; call subscribe_vault_events first".to_string(),
+            )
+        })?;
+
+        let sub_handle = SubscriptionHandle(handle);
+        let timeout = timeout_ms.map(Duration::from_millis);
+        let result = registry
+            .fetch(&sub_handle, since_seq, timeout, max_events)
+            .await
+            .map_err(to_mcp_error)?;
+
+        let dto = FetchResultDto {
+            events: result.events.into_iter().map(Into::into).collect(),
+            next_seq: result.next_seq,
+            dropped: result.dropped,
+        };
+
+        let event_count = dto.events.len();
+        StandardResponse::new(
+            &vault_name,
+            "fetch_vault_events",
+            serde_json::to_value(&dto).map_err(|e| McpError::internal(e.to_string()))?,
+        )
+        .with_count(event_count)
+        .with_duration(start.elapsed().as_millis() as u64)
+        .with_next_steps(&["fetch_vault_events", "unsubscribe_vault_events"])
+        .to_json()
+    }
+
+    /// Cancel an active vault-event subscription.
+    #[tool(
+        description = "Unregister a subscription created by subscribe_vault_events. Any events still buffered are discarded. Idempotent — unknown or already-removed handles return { removed: false }",
+        usage = "Call this when the client is done streaming; otherwise the server reaps idle subscriptions automatically after 15 minutes of no fetches",
+        performance = "Fast (<5ms)",
+        related = ["subscribe_vault_events", "fetch_vault_events"],
+        examples = ["unsubscribe_vault_events(handle: \"<uuid>\")"]
+    )]
+    async fn unsubscribe_vault_events(
+        &self,
+        handle: String,
+    ) -> McpResult<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let vault_name = self.get_active_vault_name().await?;
+
+        // No registry = nothing to unsubscribe; report removed=false.
+        let removed = match self.subscription_registry.get() {
+            Some(registry) => {
+                registry
+                    .unsubscribe(&SubscriptionHandle(handle))
+                    .await
+            }
+            None => false,
+        };
+
+        let result = UnsubResult { removed };
+        StandardResponse::new(
+            &vault_name,
+            "unsubscribe_vault_events",
+            serde_json::to_value(&result)
+                .map_err(|e| McpError::internal(e.to_string()))?,
+        )
+        .with_duration(start.elapsed().as_millis() as u64)
+        .to_json()
+    }
+}
+
+/// Format the current system time as a minimal RFC-3339 UTC string
+/// (second precision). Used by `subscribe_vault_events` to stamp
+/// `created_at` without pulling in `chrono` as a new dependency.
+fn format_iso8601_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // Safe on sane clocks; on a hypothetical pre-epoch clock we
+    // return a clearly-invalid sentinel rather than panic.
+    let secs = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => return "1970-01-01T00:00:00Z".to_string(),
+    };
+    // Convert Unix timestamp to Y/M/D H:M:S components. The math below
+    // is the standard civil-from-days algorithm (Howard Hinnant).
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let hour = (rem / 3_600) as u32;
+    let minute = ((rem % 3_600) / 60) as u32;
+    let second = (rem % 60) as u32;
+
+    // Shift so days are counted from 0000-03-01 (Hinnant's epoch).
+    let z = days + 719_468;
+    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = y + if m <= 2 { 1 } else { 0 };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, m, d, hour, minute, second
+    )
 }
