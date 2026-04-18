@@ -97,11 +97,16 @@
 pub mod atomic;
 pub mod edit;
 pub mod manager;
+pub mod subscription;
 pub mod watcher;
 
 pub use atomic::{AtomicFileOps, FileOp, TransactionResult};
 pub use edit::{EditEngine, EditResult, SearchReplaceBlock, compute_hash};
 pub use manager::VaultManager;
+pub use subscription::{
+    EventFilter, SubscriptionHandle, SubscriptionRegistry, VaultEventKind,
+    MAX_GLOB_PATTERNS, MAX_GLOB_TOTAL_BYTES, SUBSCRIPTION_CHANNEL_CAP,
+};
 pub use turbovault_core::prelude::*;
 pub use watcher::{VaultEvent, VaultWatcher, WatcherConfig};
 
@@ -109,6 +114,7 @@ pub mod prelude {
     pub use crate::atomic::*;
     pub use crate::edit::*;
     pub use crate::manager::*;
+    pub use crate::subscription::*;
     pub use crate::watcher::*;
     pub use turbovault_core::prelude::*;
 }
