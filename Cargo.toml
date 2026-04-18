@@ -53,6 +53,10 @@ petgraph = "0.6"             # 2.1M+ downloads, ecosystem standard for graphs
 notify = "6"                 # 2025 current, v6.x active maintenance
 walkdir = "2"
 
+# Glob matching — used by subscribe_vault_events for client-supplied filters.
+# globset is DoS-safe (no backtracking) and supports gitignore-style patterns.
+globset = "0.4"
+
 # Parsing utilities
 regex = "1"
 
