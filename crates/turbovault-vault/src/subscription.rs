@@ -48,6 +48,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, channel};
 use tokio::sync::{Mutex, RwLock};
@@ -68,6 +69,20 @@ pub const MAX_GLOB_TOTAL_BYTES: usize = 4096;
 /// without drops but a stalled consumer can't starve the server of
 /// memory.
 pub const SUBSCRIPTION_CHANNEL_CAP: usize = 256;
+
+/// Default TTL for an unpolled subscription before the reaper removes it.
+///
+/// The pull-based `fetch_vault_events` tool updates each subscription's
+/// `last_polled_at` on every call. If a client crashes or otherwise
+/// stops polling, its subscription would otherwise live forever; the
+/// reaper task evicts it after this idle window.
+pub const DEFAULT_SUBSCRIPTION_FETCH_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// Interval between reaper sweeps. One sweep walks the full subscription
+/// map under a write lock; a minute-granularity cadence keeps overhead
+/// negligible (the map is tiny in practice) while bounding how long a
+/// leaked subscription can linger past its TTL.
+pub const REAPER_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Kinds of vault events a subscriber can filter on.
 ///
@@ -92,6 +107,25 @@ impl VaultEventKind {
             VaultEvent::FileRenamed(_, _) => Self::Renamed,
         }
     }
+}
+
+/// A dispatched [`VaultEvent`] tagged with a per-subscription sequence
+/// number.
+///
+/// The sequence is monotonically increasing within one subscription and
+/// starts at 1. Clients that resume a long-poll after a crash can pass
+/// the last `seq` they observed as `since_seq` so they only receive
+/// events they haven't processed yet.
+///
+/// The `seq` counter is strictly per-subscription; two subscriptions
+/// may both deliver `seq=1` for different events. There is no global
+/// ordering across subscriptions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventEnvelope {
+    /// Monotonically-increasing sequence number (per-subscription).
+    pub seq: u64,
+    /// The underlying vault event.
+    pub event: VaultEvent,
 }
 
 /// Client-facing event filter. Default matches every markdown event.
@@ -257,16 +291,35 @@ struct SubscriptionState {
     id: SubscriptionHandle,
     session_id: Option<String>,
     filter: CompiledFilter,
-    sender: Sender<VaultEvent>,
+    sender: Sender<EventEnvelope>,
+    /// Monotonic per-subscription sequence number. Incremented before
+    /// each enqueue so clients always receive strictly increasing `seq`
+    /// values even if events are dropped on backpressure.
+    next_seq: std::sync::atomic::AtomicU64,
     /// Count of events dropped due to backpressure. The transport adapter
     /// can surface this to the client (e.g. via a periodic
     /// `notifications/vault/overflow` control message).
     dropped: std::sync::atomic::AtomicU64,
+    /// Timestamp of the last `fetch_vault_events` call that targeted
+    /// this subscription. Refreshed on every poll; the reaper task
+    /// evicts subscriptions whose `last_polled_at` is older than
+    /// [`DEFAULT_SUBSCRIPTION_FETCH_TTL`] so leaked subscriptions don't
+    /// accumulate.
+    last_polled_at: std::sync::Mutex<Instant>,
 }
 
 impl SubscriptionState {
     fn try_send(&self, event: VaultEvent) {
-        match self.sender.try_send(event) {
+        // Assign a sequence number before enqueueing. We use Relaxed
+        // because there is exactly one producer (the registry pump) per
+        // subscription, so no inter-thread ordering is required — only
+        // atomicity of the increment itself.
+        let seq = self
+            .next_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let envelope = EventEnvelope { seq, event };
+        match self.sender.try_send(envelope) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 // Channel full: drop the newest event and bump the
@@ -277,6 +330,11 @@ impl SubscriptionState {
                 // capacity, a sustained-full channel means the consumer
                 // is stuck; at that point what we report on resumption is
                 // a counter, not a buffer.
+                //
+                // Note the `seq` we consumed above is intentionally not
+                // reused: leaving a gap in the delivered sequence is
+                // exactly the signal clients use (alongside `dropped`)
+                // to detect that they missed at least one event.
                 self.dropped
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::warn!(
@@ -295,15 +353,43 @@ impl SubscriptionState {
     fn is_closed(&self) -> bool {
         self.sender.is_closed()
     }
+
+    /// Record that a fetcher just polled this subscription. Called from
+    /// `SubscriptionRegistry::fetch` so the reaper knows the client is
+    /// still live.
+    #[allow(dead_code)] // used by fetch() once it lands in commit 2
+    fn touch(&self) {
+        // Poisoned mutex: recover inner — losing a timestamp update is
+        // preferable to wedging the fetcher.
+        let mut guard = match self.last_polled_at.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = Instant::now();
+    }
+
+    /// Snapshot `last_polled_at`. Used by the reaper task.
+    fn last_polled_at(&self) -> Instant {
+        let guard = match self.last_polled_at.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard
+    }
 }
 
 /// Central subscription registry.
 ///
 /// Spawns one pump task on construction that consumes events from the
 /// owned [`VaultWatcher`]'s stream and dispatches to matching subscribers.
+/// Also spawns a reaper task that evicts subscriptions whose last
+/// `fetch_vault_events` call is older than the configured TTL — the
+/// pull-based design requires this safety net because a crashed client
+/// leaves no TCP close to latch onto.
 pub struct SubscriptionRegistry {
     inner: Arc<Inner>,
     pump_handle: Mutex<Option<JoinHandle<()>>>,
+    reaper_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// Combined state under a single lock. Collapsing `subs` and `by_session`
@@ -324,27 +410,42 @@ struct Inner {
     /// would silently tear down the notify stream and cause the pump to
     /// exit unseen (adversarial review Blocker #2).
     _watcher: Arc<VaultWatcher>,
+    /// Idle window after which the reaper evicts an unpolled subscription.
+    fetch_ttl: Duration,
 }
 
 impl SubscriptionRegistry {
-    /// Build a registry wrapping a started [`VaultWatcher`]. The watcher's
-    /// event receiver is drained by an internal pump task; the caller
-    /// should not attempt to consume `event_rx` themselves.
+    /// Build a registry wrapping a started [`VaultWatcher`] with the
+    /// default fetch TTL ([`DEFAULT_SUBSCRIPTION_FETCH_TTL`]).
+    ///
+    /// The watcher's event receiver is drained by an internal pump task;
+    /// the caller should not attempt to consume `event_rx` themselves.
     ///
     /// # Lifecycle
     ///
     /// The registry takes ownership of the `VaultWatcher`'s `Arc` (it is
     /// stored internally), so dropping the registry is sufficient to tear
     /// down the watcher and stop the notify subsystem. Dropping the
-    /// registry also aborts the pump task and closes all active
-    /// subscriptions' senders.
+    /// registry also aborts the pump and reaper tasks and closes all
+    /// active subscriptions' senders.
     pub fn new(
         watcher: Arc<VaultWatcher>,
+        event_rx: UnboundedReceiver<VaultEvent>,
+    ) -> Self {
+        Self::with_fetch_ttl(watcher, event_rx, DEFAULT_SUBSCRIPTION_FETCH_TTL)
+    }
+
+    /// Build a registry with an explicit fetch TTL. Useful for tests
+    /// that need to exercise the reaper without waiting 15 minutes.
+    pub fn with_fetch_ttl(
+        watcher: Arc<VaultWatcher>,
         mut event_rx: UnboundedReceiver<VaultEvent>,
+        fetch_ttl: Duration,
     ) -> Self {
         let inner = Arc::new(Inner {
             state: RwLock::new(State::default()),
             _watcher: watcher,
+            fetch_ttl,
         });
 
         let inner_pump = inner.clone();
@@ -362,32 +463,95 @@ impl SubscriptionRegistry {
             tracing::debug!("subscription pump exiting (watcher stream ended)");
         });
 
+        // Reaper: periodically walk the subscription map and evict any
+        // whose `last_polled_at` is older than the configured TTL. The
+        // sweep cadence is fixed (one minute) while the eviction
+        // threshold is configurable; this keeps the worst-case lag
+        // between "exceeded TTL" and "actually gone" bounded at
+        // ~REAPER_SWEEP_INTERVAL.
+        //
+        // We choose a wall-clock-independent sweep interval (tokio
+        // interval, not sleep-until) so pausing at a breakpoint doesn't
+        // cause the reaper to unleash a burst of evictions when
+        // execution resumes.
+        let inner_reaper = inner.clone();
+        let reaper = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(REAPER_SWEEP_INTERVAL);
+            // Skip the immediate first tick — a brand-new registry with
+            // no subscriptions has nothing to reap, and the first
+            // meaningful sweep should come ~REAPER_SWEEP_INTERVAL later.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let ttl = inner_reaper.fetch_ttl;
+                let now = Instant::now();
+                let mut state = inner_reaper.state.write().await;
+                // Collect handles to evict; we can't mutate while
+                // iterating.
+                let stale: Vec<SubscriptionHandle> = state
+                    .subs
+                    .iter()
+                    .filter_map(|(h, s)| {
+                        if now.duration_since(s.last_polled_at()) >= ttl {
+                            Some(h.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for h in &stale {
+                    if let Some(sub_state) = state.subs.remove(h) {
+                        if let Some(sid) = &sub_state.session_id {
+                            if let Some(set) = state.by_session.get_mut(sid) {
+                                set.remove(h);
+                                if set.is_empty() {
+                                    state.by_session.remove(sid);
+                                }
+                            }
+                        }
+                    }
+                }
+                if !stale.is_empty() {
+                    tracing::info!(
+                        count = stale.len(),
+                        ttl_secs = ttl.as_secs(),
+                        "reaped stale subscriptions"
+                    );
+                }
+            }
+        });
+
         Self {
             inner,
             pump_handle: Mutex::new(Some(pump)),
+            reaper_handle: Mutex::new(Some(reaper)),
         }
     }
 
     /// Register a new subscription.
     ///
-    /// The returned `Receiver` is the client-facing event stream. The
-    /// caller owns it and is responsible for draining; the registry
-    /// only holds the paired sender.
+    /// The returned `Receiver` carries sequenced envelopes (see
+    /// [`EventEnvelope`]). The caller owns it and is responsible for
+    /// draining; the registry only holds the paired sender.
     pub async fn subscribe(
         &self,
         filter: EventFilter,
         session_id: Option<String>,
-    ) -> Result<(SubscriptionHandle, Receiver<VaultEvent>)> {
+    ) -> Result<(SubscriptionHandle, Receiver<EventEnvelope>)> {
         filter.validate()?;
         let compiled = CompiledFilter::compile(&filter)?;
-        let (tx, rx) = channel::<VaultEvent>(SUBSCRIPTION_CHANNEL_CAP);
+        let (tx, rx) = channel::<EventEnvelope>(SUBSCRIPTION_CHANNEL_CAP);
         let handle = SubscriptionHandle::new();
         let sub_state = Arc::new(SubscriptionState {
             id: handle.clone(),
             session_id: session_id.clone(),
             filter: compiled,
             sender: tx,
+            next_seq: std::sync::atomic::AtomicU64::new(0),
             dropped: std::sync::atomic::AtomicU64::new(0),
+            // Initialize to "just polled" so a freshly-created
+            // subscription isn't reaped on the next sweep.
+            last_polled_at: std::sync::Mutex::new(Instant::now()),
         });
 
         // Single critical section — subs and by_session are mutated
@@ -486,6 +650,11 @@ impl SubscriptionRegistry {
 impl Drop for SubscriptionRegistry {
     fn drop(&mut self) {
         if let Ok(mut g) = self.pump_handle.try_lock() {
+            if let Some(h) = g.take() {
+                h.abort();
+            }
+        }
+        if let Ok(mut g) = self.reaper_handle.try_lock() {
             if let Some(h) = g.take() {
                 h.abort();
             }
@@ -650,8 +819,9 @@ mod tests {
         .await
         .expect("timed out")
         .expect("stream closed");
+        assert_eq!(received.seq, 1, "first delivered event should be seq=1");
         assert!(matches!(
-            received,
+            received.event,
             VaultEvent::FileCreated(ref p) if p == Path::new("00-neuro-link/plan.md")
         ));
 
